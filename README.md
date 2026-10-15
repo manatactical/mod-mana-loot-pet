@@ -18,6 +18,7 @@ the same way a looted container's overflow already is.
 | a free-for-all item that no longer fits | left on the corpse, never mailed (mailing it would consume it for every looter) |
 | an item this player was not allowed to read | left on the corpse, never mailed |
 | a corpse whose only leftovers are the above | skipped, left exactly as it is, and it does not hold up the queue |
+| a kill that dropped only money | fetched -- money counts as loot the pet can take |
 | skinning / pickpocketing loot | never taken -- separate windows on the same corpse |
 | a second kill while the pet is already fetching | queued behind the corpse it is walking to, looted one by one |
 | pet dies, despawns, is dismissed, or gets stuck | the queue survives a resummon; the corpse it cannot reach is dropped and the next one is tried |
@@ -53,8 +54,9 @@ client's loot window is untouched and the corpse looks exactly as it does when l
   loot the same way they see a hand loot.
 - The pet only walks to a corpse it can actually help itself to: a corpse holding nothing but the
   loot this module deliberately leaves behind is passed over and the next queued corpse is walked
-  instead, so a leftover never stalls the queue or parks the companion beside it. Nothing is taken
-  from that corpse, so the player's hand-loot is unchanged -- but nothing is delivered from it
+  instead, so a leftover never stalls the queue or parks the companion beside it. Money counts as
+  loot the pet can take, so the common money-only kill is still fetched. Nothing is taken from a
+  corpse that is skipped, so the player's hand-loot is unchanged -- but nothing is delivered from it
   either, so an item the player may now have room for waits for their own hand-loot.
 - An item that cannot be stored is mailed through `Player::SendItemRetrievalMail`, the same call the
   core uses for a looted container's overflow. Only plain `loot->items` entries are handled that way;

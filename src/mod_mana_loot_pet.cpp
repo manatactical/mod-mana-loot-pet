@@ -93,17 +93,25 @@ namespace
                (item->rollWinnerGUID.IsEmpty() || item->rollWinnerGUID == player->GetGUID());
     }
 
-    // True while the companion still has something of its own to take: a plain item slot that is
-    // neither looted, conditional, nor outside what this player is allowed to read. A corpse holding
-    // only its quest tail or conditional drops is done as far as the pet is concerned -- those are
-    // the player's to hand-loot. `is_blocked`, `is_underthreshold`, the eliminator's `is_counted` and
-    // a loot id's value are deliberately not checked: the first two are only ever set for group
-    // loot, and the last two exist to give a player a reward the core then decides not to (an
-    // eliminator or an EvMap boss with no loot id). An item's own conditions are not read either --
-    // a plain item with a condition the player passes is a normal drop by this point, and skipping it
-    // is cheaper than re-evaluating the condition the core already evaluated.
+    // True while the companion still has something of its own to take: the corpse's money, or a plain
+    // item slot that is neither looted, conditional, nor outside what this player is allowed to read.
+    // Money cannot be forgotten here -- most kills drop nothing but coin, and a corpse that is only
+    // money would then be skipped, which reads as "the pet fetches one kill in three". A corpse whose
+    // only leftovers are the quest tail or a conditional drop is done as far as the pet is concerned:
+    // those are the player's to hand-loot. `is_blocked`, `is_underthreshold`, the eliminator's
+    // `is_counted` and a loot id's value are deliberately not checked -- the first two are only ever
+    // set for group loot, and the last two exist to give a player a reward the core then decides not
+    // to (an eliminator, or an EvMap boss with no loot id). An item's own conditions are not read
+    // either: a plain item with a condition the player passes is a normal drop by this point, and
+    // skipping it is cheaper than re-evaluating what the core already evaluated.
     bool hasFetchableItem(Player* player, Loot* loot, ObjectGuid source)
     {
+        if (g_config.money && loot->gold)
+            return true;
+
+        if (!g_config.items)
+            return false;
+
         for (LootItem const& item : loot->items)
             if (!item.is_looted && item.conditions.empty() && readable(player, &item, source))
                 return true;
@@ -138,7 +146,8 @@ namespace
 
         // Nothing the pet can help itself to is still no reason to walk over there: a corpse holding
         // only loot that is being left for the player would strand it in the queue, stop the pet from
-        // following, and eat a ReachTimeoutMs before it moved on.
+        // following, and eat a ReachTimeoutMs before it moved on. This is the gate that decides which
+        // kills are fetched at all, so it has to count money as well as items.
         killed->loot.FillNotNormalLootFor(player);
         return hasFetchableItem(player, &killed->loot, killed->loot.sourceWorldObjectGUID);
     }
@@ -249,11 +258,13 @@ namespace
         }
 
         // A corpse with nothing left behaves exactly like one looted by hand: lootable flagged off,
-        // skinnable set, decay timer shortened. A corpse still holding a slot this player may read
-        // (the quest tail, a conditional drop) is left lootable instead: the core's own handler would
-        // refuse the follow-up, and clearing the flag would leave a corpse that never becomes looted.
-        if (loot->isLooted() ||
-            (g_config.items && !hasFetchableItem(player, loot, loot->sourceWorldObjectGUID)))
+        // skinnable set, decay timer shortened. A corpse still holding something this player may read
+        // (the quest tail, a conditional drop, a slot the pet was told not to take) is left lootable
+        // instead: the core's own handler would refuse the follow-up, and clearing the flag would
+        // leave a corpse that never becomes looted. `hasFetchableItem` is the same predicate, so a
+        // corpse the pet emptied of everything it was allowed to take settles down to the flag
+        // exactly when that predicate goes false.
+        if (loot->isLooted() || !hasFetchableItem(player, loot, loot->sourceWorldObjectGUID))
         {
             corpse->RemoveDynamicFlag(UNIT_DYNFLAG_LOOTABLE);
             corpse->ForceValuesUpdateAtIndex(UNIT_DYNAMIC_FLAGS);
