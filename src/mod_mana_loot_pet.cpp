@@ -59,6 +59,8 @@ namespace
         ObjectGuid              pet;
         uint32                  startMs = 0;   // when the walk to queue.front() was (re)started
 
+        // True once this leg of the walk has outlived ReachTimeoutMs. The timeout is per corpse: the
+        // caller drops that corpse and gives the next one a fresh startMs.
         [[nodiscard]] bool done(uint32 nowMs) const
         {
             return !pet || nowMs - startMs > g_config.reachMs;
@@ -371,18 +373,16 @@ namespace
             Creature* pet = ObjectAccessor::GetCreature(*player, fetch.pet);
 
             // A companion that vanished or died takes the queue with it: the corpses it never
-            // reached stay manually lootable.
-            if (!pet || !pet->IsAlive() || fetch.done(g_nowMs))
+            // reached stay manually lootable. A walk running late is NOT handled here -- one slow leg
+            // must not discard the rest of the pull, so it drops that corpse below and moves on.
+            if (!pet || !pet->IsAlive())
             {
                 ResumeFollow(pet, player);
                 g_fetch.erase(itr);
                 return;
             }
 
-            // Drop what is no longer worth walking to -- despawned, or looted by hand. The walk's own
-            // deadline is left to Fetch::done, which refills the queue from the pet's side: a stuck or
-            // resummoned pet spends one ReachTimeoutMs on each corpse in turn rather than losing the
-            // pull.
+            // Drop what is no longer worth walking to: a despawned object.
             while (!fetch.queue.empty() &&
                    !player->GetMap()->GetCreature(fetch.queue.front()))
             {
@@ -399,11 +399,13 @@ namespace
 
             Creature* corpse = player->GetMap()->GetCreature(fetch.queue.front());
 
-            // An empty corpse is a dead end for a pet that is stopped and has nothing to read -- the
-            // corpse was hand-looted, or the only thing it could still offer is what the module leaves
-            // behind. Moving on is what keeps the queue from stalling; the corpse itself is left
-            // exactly as it is, lootable flag and decay untouched.
-            if (corpse->loot.isLooted() ||
+            // A corpse is skipped when it is already empty, when it holds nothing the pet may take,
+            // or when this leg of the walk has run out of time (stuck, rooted, unreachable). The
+            // timeout drops only this corpse and gives the next one a fresh ReachTimeoutMs, so one
+            // bad body costs its own deadline instead of the whole pull; only a pet that never gets
+            // anywhere drains the queue. The corpse itself is left exactly as it is, lootable flag
+            // and decay untouched.
+            if (corpse->loot.isLooted() || fetch.done(g_nowMs) ||
                 !hasFetchableItem(player, &corpse->loot, corpse->loot.sourceWorldObjectGUID))
             {
                 fetch.queue.erase(fetch.queue.begin());
@@ -416,19 +418,20 @@ namespace
                     return;
                 }
 
-                if (!pet->HasUnitState(UNIT_STATE_ROAMING_MOVE))
-                    SendToCorpse(pet, player->GetMap()->GetCreature(fetch.queue.front()));
-
+                SendToCorpse(pet, player->GetMap()->GetCreature(fetch.queue.front()));
                 return;
             }
 
-            // Arrival needs no handshake: PointMovementGenerator::DoFinalize clears
-            // UNIT_STATE_ROAMING_MOVE, so "stopped and in range" is the pet standing on the corpse.
-            if (!pet->HasUnitState(UNIT_STATE_ROAMING_MOVE))
-                return;
-
             if (!pet->IsWithinDistInMap(corpse, g_config.lootDistance))
+            {
+                // Stopped and still out of range: the walk was interrupted (evade, resummon), so it is
+                // re-aimed here instead of waiting out a whole ReachTimeoutMs in place. A moving pet
+                // is left to finish its own walk.
+                if (!pet->HasUnitState(UNIT_STATE_ROAMING_MOVE))
+                    SendToCorpse(pet, corpse);
+
                 return;
+            }
 
             // LootCorpse fires script hooks, and a hook that leaves loot behind can re-enter
             // OnPlayerCreatureKillCredit -- which mutates g_fetch. So the entry is re-looked-up from
@@ -461,10 +464,12 @@ namespace
                 return;
             }
 
-            // The pet is standing where it was sent -- on the corpse just looted -- so the next one
-            // needs a fresh walk. A re-entrant kill that already aimed it is left alone.
-            if (!pet->HasUnitState(UNIT_STATE_ROAMING_MOVE))
-                SendToCorpse(pet, player->GetMap()->GetCreature(fetch.queue.front()));
+            // The pet is sent to the next corpse unconditionally. It has to be: the loot above happens
+            // the moment it is in range, which is usually while it is still walking, so the walk it is
+            // on is still heading for the corpse just looted. Skipping the send on "already moving"
+            // would leave it standing there with the rest of the queue never walked to -- the point
+            // generator finalises, UNIT_STATE_ROAMING_MOVE clears, and nothing re-aims it ever again.
+            SendToCorpse(pet, player->GetMap()->GetCreature(fetch.queue.front()));
         }
 
         void OnPlayerLogout(Player* player) override
