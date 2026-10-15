@@ -1,0 +1,83 @@
+#
+# mod-mana-loot-pet configuration
+#
+# The player's vanity companion (a non-combat pet) walks to a fresh corpse and loots it. Only a
+# creature whose sole loot recipient is the killing player is served, so group loot rules and rolls
+# are never bypassed, and one corpse is fetched at a time.
+#
+
+[worldserver]
+
+########################################
+# The companion fetch
+########################################
+
+#
+#    ManaLootPet.Enable
+#        Description: Enable the module. With 0 no fetch is ever started and the companion behaves
+#                     exactly as before.
+#        Default:     1 - Enabled
+#                     0 - Disabled
+#
+
+ManaLootPet.Enable = 1
+
+#
+#    ManaLootPet.LootDistance
+#        Description: How close, in yards, the companion must get to the corpse before the loot is
+#                     taken. This is what makes the fetch visible: the pet has to actually reach the
+#                     corpse. Raise it and the loot moves while the pet is still walking; lower it
+#                     and the pet must stand on the body. Values below 0.5 are raised to 0.5.
+#        Default:     3.0
+#
+
+ManaLootPet.LootDistance = 3.0
+
+#
+#    ManaLootPet.ReachTimeoutMs
+#        Description: How long, in milliseconds, a fetch may take before it is abandoned. Covers the
+#                     companion getting stuck, rooted or killed on the way, and a corpse that has
+#                     already decayed. Values below 1000 are raised to 1000.
+#        Default:     8000
+#
+
+ManaLootPet.ReachTimeoutMs = 8000
+
+#
+#    ManaLootPet.LootMoney
+#        Description: Take the corpse's money for the player.
+#        Default:     1 - Enabled
+#                     0 - Disabled
+#
+
+ManaLootPet.LootMoney = 1
+
+#
+#    ManaLootPet.LootItems
+#        Description: Take the corpse's items for the player. Quest items, conditional drops and
+#                     rolled items are always left on the corpse for the player to hand-loot.
+#        Default:     1 - Enabled
+#                     0 - Disabled
+#
+
+ManaLootPet.LootItems = 1
+
+#
+#    ManaLootPet.MailWhenBagsFull
+#        Description: When an item does not fit in the player's bags, mail it through the Postmaster
+#                     instead of leaving it on the corpse. With 0 the item is left lootable, so the
+#                     corpse does not clear until the player makes room and hands it over.
+#        Default:     1 - Enabled
+#                     0 - Disabled
+#
+
+ManaLootPet.MailWhenBagsFull = 1
+
+#
+#    ManaLootPet.MaxItemsPerCorpse
+#        Description: Most item slots taken from one corpse in a single fetch, so one very rich corpse
+#                     cannot fill the whole inventory in one tick. Values below 1 are raised to 1.
+#        Default:     20
+#
+
+ManaLootPet.MaxItemsPerCorpse = 20
