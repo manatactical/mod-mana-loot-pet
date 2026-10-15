@@ -38,7 +38,7 @@ namespace
     struct Config
     {
         bool   enabled      = true;
-        float  lootDistance = 3.0f;  // how close the pet must get before the corpse is looted
+        float  lootDistance = 1.5f;  // how close the pet must get before the corpse is looted
         uint32 reachMs      = 8000;  // a fetch older than this is abandoned (pet stuck or corpse gone)
         bool   money        = true;
         bool   items        = true;
@@ -295,7 +295,7 @@ namespace
         void OnAfterConfigLoad(bool /*reload*/) override
         {
             g_config.enabled      = sConfigMgr->GetOption<bool>("ManaLootPet.Enable", true);
-            g_config.lootDistance = sConfigMgr->GetOption<float>("ManaLootPet.LootDistance", 3.0f);
+            g_config.lootDistance = sConfigMgr->GetOption<float>("ManaLootPet.LootDistance", 1.5f);
             g_config.reachMs      = sConfigMgr->GetOption<uint32>("ManaLootPet.ReachTimeoutMs", 8000);
             g_config.money        = sConfigMgr->GetOption<bool>("ManaLootPet.LootMoney", true);
             g_config.items        = sConfigMgr->GetOption<bool>("ManaLootPet.LootItems", true);

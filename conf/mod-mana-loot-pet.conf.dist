@@ -28,11 +28,13 @@ ManaLootPet.Enable = 1
 #        Description: How close, in yards, the companion must get to the corpse before the loot is
 #                     taken. This is what makes the fetch visible: the pet has to actually reach the
 #                     corpse. Raise it and the loot moves while the pet is still walking; lower it
-#                     and the pet must stand on the body. Values below 0.5 are raised to 0.5.
-#        Default:     3.0
+#                     and the pet must stand on the body. It also caps how far away the pet aims
+#                     when sent over (60% of it, never under half a yard). Values below 0.5 are
+#                     raised to 0.5.
+#        Default:     1.5
 #
 
-ManaLootPet.LootDistance = 3.0
+ManaLootPet.LootDistance = 1.5
 
 #
 #    ManaLootPet.ReachTimeoutMs

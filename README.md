@@ -106,7 +106,7 @@ These are deliberate for now, not defects:
 | key | default | meaning |
 |---|---|---|
 | `ManaLootPet.Enable` | 1 | master switch |
-| `ManaLootPet.LootDistance` | 3.0 | yards the pet must close before the loot is taken |
+| `ManaLootPet.LootDistance` | 1.5 | yards the pet must close before the loot is taken (also caps how far away it aims) |
 | `ManaLootPet.ReachTimeoutMs` | 8000 | how long the pet may walk to **one** corpse before that corpse is dropped (the rest of the queue is kept) |
 | `ManaLootPet.LootMoney` | 1 | take the corpse's money |
 | `ManaLootPet.LootItems` | 1 | take the corpse's items |
