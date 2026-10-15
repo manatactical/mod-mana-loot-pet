@@ -83,7 +83,6 @@ namespace
         // (no reward, insufficient damage).
         if (!killed->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE))
             return false;
-            return false;
         // Never take skinning or pickpocketing loot: those are separate windows on the same corpse.
         if (killed->loot.loot_type != LOOT_NONE && killed->loot.loot_type != LOOT_CORPSE)
             return false;
