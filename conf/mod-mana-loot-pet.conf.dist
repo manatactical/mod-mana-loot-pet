@@ -3,7 +3,8 @@
 #
 # The player's vanity companion (a non-combat pet) walks to a fresh corpse and loots it. Only a
 # creature whose sole loot recipient is the killing player is served, so group loot rules and rolls
-# are never bypassed, and one corpse is fetched at a time.
+# are never bypassed, and one corpse is walked at a time -- a pull that kills several creatures queues
+# them and the pet visits each in turn.
 #
 
 [worldserver]
@@ -14,8 +15,8 @@
 
 #
 #    ManaLootPet.Enable
-#        Description: Enable the module. With 0 no fetch is ever started and the companion behaves
-#                     exactly as before.
+#        Description: Enable the module. With 0 no new fetch is started and the companion behaves
+#                     exactly as before. A fetch already in flight is left to finish.
 #        Default:     1 - Enabled
 #                     0 - Disabled
 #
@@ -35,7 +36,8 @@ ManaLootPet.LootDistance = 3.0
 
 #
 #    ManaLootPet.ReachTimeoutMs
-#        Description: How long, in milliseconds, a fetch may take before it is abandoned. Covers the
+#        Description: How long, in milliseconds, the companion may spend walking to one corpse
+#                     before that corpse is dropped and the next one in the queue is tried. Covers the
 #                     companion getting stuck, rooted or killed on the way, and a corpse that has
 #                     already decayed. Values below 1000 are raised to 1000.
 #        Default:     8000
@@ -75,8 +77,10 @@ ManaLootPet.MailWhenBagsFull = 1
 
 #
 #    ManaLootPet.MaxItemsPerCorpse
-#        Description: Most item slots taken from one corpse in a single fetch, so one very rich corpse
-#                     cannot fill the whole inventory in one tick. Values below 1 are raised to 1.
+#        Description: Most item slots the companion takes (or mails) from one corpse in a single
+#                     fetch, so one very rich corpse cannot fill the whole inventory in one tick.
+#                     Slots left for the player to hand-loot do not count. Values below 1 are raised
+#                     to 1.
 #        Default:     20
 #
 
