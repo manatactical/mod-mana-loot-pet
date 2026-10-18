@@ -49,22 +49,36 @@ client's loot window is untouched and the corpse looks exactly as it does when l
   protection, roll winners, blocked and not-allowed items -- so nothing is taken that the player
   could not have taken by hand; an item the core would refuse outright is left on the corpse, while
   one that only failed to fit is mailed. The money and item hooks the core raises
-  (`OnPlayerBeforeLootMoney`, `OnPlayerAfterCreatureLootMoney`, `OnLootMoney`, and
-  `OnPlayerAfterCreatureLoot` per stored item) are raised here too, so other modules see a companion
-  loot the same way they see a hand loot.
+  (`OnPlayerBeforeLootMoney`, `OnPlayerAfterCreatureLootMoney`, `OnLootMoney`) are raised here too, and
+  `OnPlayerAfterCreatureLoot` is raised once for the whole corpse -- as the core raises it, once per
+  loot action, not once per item -- so other modules see a companion loot the same way they see a hand
+  loot.
+- Whether a slot can be taken is asked with `CanStoreNewItem` before it is taken rather than letting
+  `StoreLootItem` refuse: the core's refusal sends the player a red inventory/unique error, which is
+  wrong here because the refusal is not the player's action and an un-storable slot is mailed instead.
+  A slot the pet was configured to leave behind, or one belonging to another looter, is left exactly
+  as it was -- nothing is even asked about it -- so a corpse needing a later hand-loot is never drained
+  by a retry loop.
 - The pet only walks to a corpse it can actually help itself to: a corpse holding nothing but the
   loot this module deliberately leaves behind is passed over and the next queued corpse is walked
   instead, so a leftover never stalls the queue or parks the companion beside it. Money counts as
   loot the pet can take, so the common money-only kill is still fetched. Nothing is taken from a
   corpse that is skipped, so the player's hand-loot is unchanged -- but nothing is delivered from it
   either, so an item the player may now have room for waits for their own hand-loot.
-- An item that cannot be stored is mailed through `Player::SendItemRetrievalMail`, the same call the
-  core uses for a looted container's overflow. Only plain `loot->items` entries are handled that way;
-  quest and conditional entries are left for the player, because their per-player slot bookkeeping is
-  not worth undoing by hand.
-- When the corpse empties it is cleaned up exactly as a hand-looted corpse is: the lootable flag is
+- An item that cannot be stored is mailed by the Postmaster draft this module builds itself, in the
+  core's own letter text. The whole corpse is passed in one batch, so its un-storable slots share a
+  mail (`MAX_MAIL_ITEMS`, 12, per mail) instead of arriving one mail each, and the mail is built from
+  an item instance -- the loot's random roll travels with it. Only plain `loot->items` entries are
+  handled that way; quest and conditional entries are left for the player, because their per-player
+  slot bookkeeping is not worth undoing by hand.
+- When the corpse is settled it is cleaned up exactly as a hand-looted corpse is: the lootable flag is
   cleared and its value update forced, `Creature::AllLootRemovedFromCorpse` runs (skinnable flag,
-  decay timer), and the loot is cleared.
+  decay timer), and the loot is cleared. The gate is `Loot::isLooted()`, deliberately not
+  `hasFetchableItem`: the latter asks what the *pet* may take, so a corpse holding only loot the
+  module's own `LootMoney`/`LootItems` options excluded would have been torn down with that loot still
+  on it. `isLooted()` is the core's own emptiness test -- `Loot::FillNotNormalLootFor` counts this
+  player's quest, free-for-all and conditional slots into `unlootedCount`, so it stays false while
+  anything is left to hand-loot.
 
 ## Limits
 
@@ -83,18 +97,25 @@ These are deliberate for now, not defects:
   core's own handler would pass. `Player::StoreLootItem` raises `sScriptMgr->OnPlayerLootItem`, but
   this module takes items directly and never has the `Item*` the hook wants, so other modules
   listening for a *hand* loot still do not hear about a companion item loot.
-- **Overflow mail diverges from the core.** A corpse's un-storable item is mailed (`SendItemRetrievalMail`),
-  where the core mails only an item container's overflow. The mail is a plain stack, so a random
-  suffix is lost, and a free-for-all slot is left on the corpse rather than consumed for every looter.
-- **Already-looted items on a partially looted corpse** still generate their equip error internally
-  in `StoreLootItem` before the module can mail them. A corpse the player started by hand and then
-  left with a full bag can therefore print one error line per such slot.
+- **Overflow mail diverges from the core.** A corpse's un-storable item is mailed from a draft this
+  module builds (`MailOverflow`), where the core mails only an item container's overflow and does so
+  through `SendItemRetrievalMail`. The draft is needed because that call takes `(entry, count)` and
+  re-creates the stack, dropping the loot's random roll; `Item::CreateItem(entry, count, player,
+  false, randomPropertyId)` -- the call the store path uses -- keeps it. A random *suffix's* amount is
+  still re-rolled when the mail is read, because the item's suffix seed is not what gets persisted.
+  A free-for-all slot is left on the corpse rather than consumed for every looter.
+- **Already-looted items on a partially looted corpse** no longer print an error for every slot: the
+  storable check runs before `StoreLootItem`, so a slot the pet cannot take is never handed to it to
+  refuse. A corpse the player started by hand and left with a full bag is left for that player.
+- **An un-storable slot whose mail cannot be built** (item template missing, DB error) is logged and
+  dropped, and the corpse settles as if the pet had taken it: the slot was already marked looted, so
+  there is nothing left to retry. `shortcut: the loss is server-log only, no client notice; upgrade if
+  players report missing overflow mail with no explanation.`
 - **A reward-less kill is not fetched.** The gate is `UNIT_DYNFLAG_LOOTABLE`, so a corpse the core
   decided may not be looted (insufficient damage, no reward) is left alone -- which is the point.
-- **A corpse the companion passes over is left exactly as it is**: its lootable flag and decay are
-  untouched, so the player's hand-loot is what the core expects. The follow-up error that a
-  full-bag item would otherwise print when the pet stands beside a corpse it cannot finish is
-  therefore avoided -- but so is taking it, unless a later kill brings the pet back.
+- **A corpse is settled on loot, not on the options.** `LootMoney=0` or `LootItems=0` stops the pet
+  taking that kind of loot; it never tears the corpse down. The same holds for what the pet always
+  leaves behind (quest tail, free-for-all, conditional drops): those keep the corpse lootable.
 - **The queue is not saved across a restart or a long disconnect**, and there is no cap on its
   length: a pull that kills fifty creatures queues fifty corpses, all walked in kill order.
 - **A config reload does not move a fetch that is already in flight**, and the pet's decision to

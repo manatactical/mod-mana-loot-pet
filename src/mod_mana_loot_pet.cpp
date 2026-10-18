@@ -16,10 +16,14 @@
 
 #include "Config.h"
 #include "Creature.h"
+#include "DatabaseEnv.h"
 #include "Item.h"
+#include "Log.h"
 #include "LootMgr.h"
+#include "Mail.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
+#include "ObjectMgr.h"
 #include "Opcodes.h"
 #include "PetDefines.h"
 #include "Player.h"
@@ -29,6 +33,7 @@
 #include "WorldPacket.h"
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <numbers>
 #include <unordered_map>
@@ -46,7 +51,7 @@ namespace
         uint32 maxItems     = 20;    // most slots taken from one corpse in a single fetch
     };
 
-    Config g_config;
+    Config g_config;   // rebuilt whole, under g_fetchMutex, by a config reload
 
     // One entry per player: the corpses the companion still owes a visit, in the order they dropped.
     // The pet's own GUID is kept because a companion summoned or dismissed mid-fetch makes the
@@ -60,10 +65,11 @@ namespace
         uint32                  startMs = 0;   // when the walk to queue.front() was (re)started
 
         // True once this leg of the walk has outlived ReachTimeoutMs. The timeout is per corpse: the
-        // caller drops that corpse and gives the next one a fresh startMs.
-        [[nodiscard]] bool done(uint32 nowMs) const
+        // caller drops that corpse and gives the next one a fresh startMs. The deadline is passed in
+        // rather than read from g_config so the caller reads the config once, under its own lock.
+        [[nodiscard]] bool done(uint32 nowMs, uint32 reachMs) const
         {
-            return !pet || nowMs - startMs > g_config.reachMs;
+            return !pet || nowMs - startMs > reachMs;
         }
     };
 
@@ -72,6 +78,26 @@ namespace
     // above 1), one of them re-enters through a script hook, and one sends a packet.
     std::unordered_map<ObjectGuid, Fetch> g_fetch;
     std::recursive_mutex                  g_fetchMutex;
+
+    // How many players have a fetch in flight. Read without the lock as an early-out, so the common
+    // player tick -- no companion fetch anywhere -- never serialises the map threads on g_fetchMutex.
+    std::atomic<uint32> g_fetchCount{0};
+
+    // A reload rebuilds the config on the world thread while the map threads read it, so a read goes
+    // through the same recursive mutex that guards the fetches: never a torn value, and safe to call
+    // from inside a hook that already holds it.
+    Config ReadConfig()
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
+        return g_config;
+    }
+
+    // Every erase of a fetch goes through here, so g_fetchCount cannot drift from g_fetch.
+    void EraseFetch(std::unordered_map<ObjectGuid, Fetch>::iterator itr)
+    {
+        g_fetch.erase(itr);
+        g_fetchCount.fetch_sub(1, std::memory_order_release);
+    }
 
     // Refresh the clock once per world tick so N players cost one call rather than one each. A fresh
     // process starts at 1 so that "never set" cannot read as a fetch that started at zero.
@@ -91,27 +117,19 @@ namespace
     // per-player conditions, and hides a follow_loot_rules entry from LootItemInSlot entirely.
     bool readable(Player* player, LootItem const* item, ObjectGuid source)
     {
-        return item->AllowedForPlayer(player, source) &&
+        return player && item && item->AllowedForPlayer(player, source) &&
                (item->rollWinnerGUID.IsEmpty() || item->rollWinnerGUID == player->GetGUID());
     }
 
-    // True while the companion still has something of its own to take: the corpse's money, or a plain
-    // item slot that is neither looted, conditional, nor outside what this player is allowed to read.
-    // Money cannot be forgotten here -- most kills drop nothing but coin, and a corpse that is only
-    // money would then be skipped, which reads as "the pet fetches one kill in three". A corpse whose
-    // only leftovers are the quest tail or a conditional drop is done as far as the pet is concerned:
-    // those are the player's to hand-loot. `is_blocked`, `is_underthreshold`, the eliminator's
-    // `is_counted` and a loot id's value are deliberately not checked -- the first two are only ever
-    // set for group loot, and the last two exist to give a player a reward the core then decides not
-    // to (an eliminator, or an EvMap boss with no loot id). An item's own conditions are not read
-    // either: a plain item with a condition the player passes is a normal drop by this point, and
-    // skipping it is cheaper than re-evaluating what the core already evaluated.
-    bool hasFetchableItem(Player* player, Loot* loot, ObjectGuid source)
+    // Something on the corpse the pet is allowed to take: money, or one plain item slot that is
+    // readable. The two options are passed in rather than read from the global, so a caller that
+    // already decided which kinds of loot are in play does not read the config twice.
+    bool hasFetchableItem(Player* player, Loot* loot, ObjectGuid source, Config const& cfg)
     {
-        if (g_config.money && loot->gold)
+        if (cfg.money && loot->gold)
             return true;
 
-        if (!g_config.items)
+        if (!cfg.items)
             return false;
 
         for (LootItem const& item : loot->items)
@@ -120,11 +138,16 @@ namespace
         return false;
     }
 
+    // The correctness of the corpse teardown rests on `Loot::unlootedCount`, not on the options: the
+    // per-player fill below is what puts the quest tail, the free-for-all slots and the conditional
+    // drops into it, so `loot->isLooted()` answers "would the core call this corpse empty for this
+    // player" -- the same question its own `HandleLootRelease` asks before it clears the loot.
+
     // A fresh corpse is worth fetching only if this player is its sole recipient: a group
-    // recipient, or another player, keeps its own loot rules and rolls.
-    bool canFetch(Player* player, Creature* killed)
+    // recipient, or another player, keeps its own loot rules and rolls. `cfg` is the caller's snapshot.
+    bool canFetch(Player* player, Creature* killed, Config const& cfg)
     {
-        if (!g_config.enabled || !player || !killed || !killed->IsInWorld())
+        if (!cfg.enabled || !player || !killed || !killed->IsInWorld())
             return false;
         if (killed->GetLootRecipientGUID() != player->GetGUID() || killed->GetLootRecipientGroup())
             return false;
@@ -151,18 +174,18 @@ namespace
         // following, and eat a ReachTimeoutMs before it moved on. This is the gate that decides which
         // kills are fetched at all, so it has to count money as well as items.
         killed->loot.FillNotNormalLootFor(player);
-        return hasFetchableItem(player, &killed->loot, killed->loot.sourceWorldObjectGUID);
+        return hasFetchableItem(player, &killed->loot, killed->loot.sourceWorldObjectGUID, cfg);
     }
 
     // Point the pet at a corpse and let it walk. frand asserts max >= min, and lootDistance is only
     // clamped to >= 0.5, so the spawn radius is the lower bound whenever a small LootDistance
     // (down to the documented 0.5) would otherwise put the upper bound below it.
-    void SendToCorpse(Creature* pet, Creature* corpse)
+    void SendToCorpse(Creature* pet, Creature* corpse, float lootDistance)
     {
         if (!pet || !corpse)
             return;
 
-        float const spread = std::max(0.5f, g_config.lootDistance * 0.6f);
+        float const spread = std::max(0.5f, lootDistance * 0.6f);
         pet->GetMotionMaster()->MovePoint(0, corpse->GetNearPosition(
             frand(0.5f, spread), frand(0.0f, 2.0f * std::numbers::pi_v<float>)));
     }
@@ -176,17 +199,97 @@ namespace
                                                MOTION_SLOT_ACTIVE);
     }
 
+    // The Postmaster's own letter text, as the core's `Player::SendItemRetrievalMail` uses it.
+    char const* const kMailSubject = "Recovered Item";
+    char const* const kMailBody    = "We recovered a lost item in the twisting nether and noted that it was yours.$B$BPlease find said object enclosed.";
+
+    // One un-storable slot, as the mail needs it back: a mail stores an item instance, so unlike
+    // (entry, count) it also carries the loot's random roll. `count` is the rolled stack size.
+    struct Overflow
+    {
+        uint32 itemid;
+        uint32 count;
+        int32  randomPropertyId;   // > 0 a random-property id, < 0 a random-suffix id, 0 neither
+    };
+
+    // Mail the slots the pet could not store, as few mails as the mailbox allows. This is the body
+    // of the core's own `Player::SendItemRetrievalMail` batch, over item instances rather than
+    // (entry, count) pairs: that overload re-creates each stack and so drops a looted item's random
+    // roll, while `Item::CreateItem` -- the call the store path itself uses -- takes it. A slot that
+    // cannot be recovered at all (item template gone, DB error) is logged and dropped: the corpse has
+    // already given it up, and the failure is not something the player did.
+    void MailOverflow(Player* player, std::vector<Overflow> const& overflow)
+    {
+        if (overflow.empty())
+            return;
+
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+        MailDraft                   draft(kMailSubject, kMailBody);
+        MailSender const            sender(MAIL_CREATURE, 34337 /* The Postmaster */);
+        MailReceiver const          receiver(player, player->GetGUID().GetCounter());
+        uint32                      perMail = 0;
+
+        for (Overflow const& entry : overflow)
+        {
+            // A stack above the item's own maximum would be silently clamped by CreateItem, the same
+            // loss the pair overload guards against with its own split.
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry.itemid);
+            if (!proto)
+            {
+                LOG_ERROR("modules", "mod-mana-loot-pet: cannot mail unknown item {}", entry.itemid);
+                continue;
+            }
+
+            // CreateItem already applies the loot's random roll (a suffix factor of its own is seeded
+            // from the entry, as the core does on a load, so there is no seed to carry over).
+            int32 const suffix = entry.randomPropertyId;
+
+            for (uint32 left = entry.count; left;)
+            {
+                uint32 const count = std::min(left, proto->GetMaxStackSize());
+                Item* mailItem     = Item::CreateItem(entry.itemid, count, player, false, suffix);
+                if (!mailItem)
+                {
+                    LOG_ERROR("modules", "mod-mana-loot-pet: cannot create item {} for mail", entry.itemid);
+                    break;
+                }
+
+                mailItem->SaveToDB(trans);   // saved first so a failed send cannot lose it
+
+                draft.AddItem(mailItem);
+                left -= count;
+
+                if (++perMail >= MAX_MAIL_ITEMS)
+                {
+                    draft.SendMailTo(trans, receiver, sender);
+                    draft   = MailDraft(kMailSubject, kMailBody);
+                    perMail = 0;
+                }
+            }
+        }
+
+        if (perMail)
+            draft.SendMailTo(trans, receiver, sender);
+
+        CharacterDatabase.CommitTransaction(trans);
+    }
+
     // Walk the corpse's loot into the player. Mirrors the core's own single-player loot path
     // (HandleAutostoreLootItemOpcode / HandleLootMoneyOpcode), minus the loot window: no window is
-    // ever sent, so the client never has to be told the corpse was looted.
-    void LootCorpse(Player* player, Creature* corpse)
+    // ever sent, so the client never has to be told the corpse was looted. `cfg` is the caller's
+    // snapshot, so nothing here can disagree with the config the fetch pass read.
+    void LootCorpse(Player* player, Creature* corpse, Config const& cfg)
     {
         Loot* loot = &corpse->loot;
+
+        // Whether the pet actually took anything, which is what the "a creature was looted" report
+        // below keys off: a corpse it was told to leave alone must not report a loot.
+        bool tookAnything = false;
 
         // Per-player FFA / quest / conditional caches, normally built by Player::SendLoot. Idempotent.
         loot->FillNotNormalLootFor(player);
 
-        if (g_config.money && loot->gold)
+        if (cfg.money && loot->gold)
         {
             // Mirrors HandleLootMoneyOpcode's copy: the report hooks take the amount that dropped.
             // There is no partial-play-time halving to do -- canFetch refuses a restricted player, and
@@ -201,6 +304,7 @@ namespace
 
             if (awarded)
             {
+                tookAnything = true;
                 player->ModifyMoney(int32(awarded));
                 player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_LOOT_MONEY, awarded);
 
@@ -214,7 +318,7 @@ namespace
             loot->gold = 0;
         }
 
-        if (g_config.items)
+        if (cfg.items)
         {
             // Only the plain item list is walked: LootItemInSlot puts slot >= items.size() into the
             // quest_items tail, and a conditional drop keeps its QuestItem bookkeeping in a per-player
@@ -223,50 +327,84 @@ namespace
             uint32 const maxSlot = uint32(loot->items.size());
             uint32       taken   = 0;
 
-            for (uint32 slot = 0; slot < maxSlot && taken < g_config.maxItems; ++slot)
+            // Slots the pet cannot store, mailed in one batch after the walk: mailing each slot on
+            // the spot would build one draft -- one mail -- per item.
+            std::vector<Overflow> overflow;
+
+            for (uint32 slot = 0; slot < maxSlot && taken < cfg.maxItems; ++slot)
             {
                 LootItem* item = loot->LootItemInSlot(slot, player);
-                if (!item || item->is_looted || !item->conditions.empty())
+                // Not this player's to take (another looter's, or hidden by `follow_loot_rules`):
+                // `StoreLootItem` would answer that with `SendLootRelease`, and the slot must stay on
+                // the corpse, so it is never even asked about.
+                if (!item || item->is_looted || !item->conditions.empty() ||
+                    !readable(player, item, loot->sourceWorldObjectGUID))
                     continue;
 
-                // StoreLootItem can refuse for reasons other than a full bag -- blocked, won by
-                // another roller, not allowed for this player -- and a refusal leaves the corpse
-                // untouched, so an unchanged unlootedCount is what says "nothing was taken".
-                uint32 const    before = loot->unlootedCount;
-                InventoryResult msg    = EQUIP_ERR_OK;
-                player->StoreLootItem(uint8(slot), loot, msg);
-
-                if (loot->unlootedCount != before)
-                    sScriptMgr->OnPlayerAfterCreatureLoot(player);   // the core raises this per store
-                else if (g_config.mailOverflow && !item->freeforall &&
-                         readable(player, item, loot->sourceWorldObjectGUID))
+                // Ask the storage check directly rather than letting `StoreLootItem` refuse: it
+                // answers with a red inventory/unique error on the client, which is wrong here
+                // because the refusal is not the player's action and the item is about to be mailed.
+                // "Can there be room for it" also covers a unique the player already owns, and it is
+                // silent; the loot is not touched by asking.
+                ItemPosCountVec    dest;
+                InventoryResult const storable = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest,
+                                                                        item->itemid, item->count);
+                if (storable == EQUIP_ERR_OK)
                 {
-                    // Not storable (bags full, unique already owned). Mail it so it is not destroyed
-                    // and the corpse can clear -- a deliberate divergence from the core, which mails
-                    // only an item container's overflow: the mail is a plain stack, so a random suffix
-                    // is lost. A free-for-all slot is left alone because marking it looted would
-                    // consume it for every looter. A mail costs one slot of the same per-corpse budget,
-                    // so a corpse with more items than the bags hold still stops at MaxItemsPerCorpse.
-                    player->SendItemRetrievalMail(item->itemid, item->count);
-                    item->is_looted = true;
-                    loot->NotifyItemRemoved(item->itemIndex);
-                    --loot->unlootedCount;
-                }
-                else
-                    continue;   // refused outright, or deliberately left: nothing left the corpse
+                    uint32 const before = loot->unlootedCount;
+                    InventoryResult msg = EQUIP_ERR_OK;
+                    player->StoreLootItem(uint8(slot), loot, msg);
 
+                    if (loot->unlootedCount != before)
+                    {
+                        tookAnything = true;
+                        ++taken;
+                    }
+                    // A refusal the check above did not predict took nothing and reported itself;
+                    // the slot stays on the corpse for the next pass.
+                    continue;
+                }
+
+                if (!cfg.mailOverflow || item->freeforall)
+                    continue;   // left on the corpse deliberately
+
+                // Not storable (bags full, unique already owned). Mail it so it is not destroyed and
+                // the corpse can clear -- a deliberate divergence from the core, which mails only an
+                // item container's overflow. A free-for-all slot is left alone because marking it
+                // looted would consume it for every looter. Queued, not mailed here, so the whole
+                // corpse travels in as few mails as the mailbox allows; a queued slot still costs one
+                // slot of the same per-corpse budget, so a corpse with more items than the bags hold
+                // stops at MaxItemsPerCorpse. The loot's random roll travels with it, because the mail
+                // is built from an item instance rather than (entry, count).
+                overflow.push_back({ item->itemid, item->count, item->randomPropertyId });
+                item->is_looted = true;
+                loot->NotifyItemRemoved(item->itemIndex);
+                --loot->unlootedCount;
+                tookAnything = true;
                 ++taken;
             }
+
+            // One batch for the whole corpse: MAX_MAIL_ITEMS (12) items per mail, so only a bigger
+            // overflow spills into a second. A slot whose mail could not be built at all (item template
+            // gone, DB error) is logged inside and not retried: the corpse has already given it up.
+            // shortcut: that loss is a server log line with no client notice, upgrade if players report
+            // missing overflow mail with no explanation.
+            MailOverflow(player, overflow);
         }
 
-        // A corpse with nothing left behaves exactly like one looted by hand: lootable flagged off,
-        // skinnable set, decay timer shortened. A corpse still holding something this player may read
-        // (the quest tail, a conditional drop, a slot the pet was told not to take) is left lootable
-        // instead: the core's own handler would refuse the follow-up, and clearing the flag would
-        // leave a corpse that never becomes looted. `hasFetchableItem` is the same predicate, so a
-        // corpse the pet emptied of everything it was allowed to take settles down to the flag
-        // exactly when that predicate goes false.
-        if (loot->isLooted() || !hasFetchableItem(player, loot, loot->sourceWorldObjectGUID))
+        // One "a creature was looted" report for the whole corpse, which is what the core's own
+        // handler raises -- once per loot action -- and not once per item taken. The money report is
+        // its own hook above, exactly as in `HandleLootMoneyOpcode`.
+        if (tookAnything)
+            sScriptMgr->OnPlayerAfterCreatureLoot(player);
+
+        // A corpse with nothing left for this player behaves exactly like one looted by hand: lootable
+        // flagged off, skinnable set, decay timer shortened. `Loot::unlootedCount` is the whole test --
+        // `FillNotNormalLootFor` above just filled this player's quest / free-for-all / conditional
+        // slots into it, so it is non-zero whenever something is still there to hand-loot, whatever the
+        // module's own options say about what the pet may take. That is what stops the old bug: a corpse
+        // holding only loot the options excluded used to be torn down with that loot still on it.
+        if (loot->isLooted())
         {
             corpse->RemoveDynamicFlag(UNIT_DYNFLAG_LOOTABLE);
             corpse->ForceValuesUpdateAtIndex(UNIT_DYNAMIC_FLAGS);
@@ -294,22 +432,28 @@ namespace
 
         void OnAfterConfigLoad(bool /*reload*/) override
         {
-            g_config.enabled      = sConfigMgr->GetOption<bool>("ManaLootPet.Enable", true);
-            g_config.lootDistance = sConfigMgr->GetOption<float>("ManaLootPet.LootDistance", 1.5f);
-            g_config.reachMs      = sConfigMgr->GetOption<uint32>("ManaLootPet.ReachTimeoutMs", 8000);
-            g_config.money        = sConfigMgr->GetOption<bool>("ManaLootPet.LootMoney", true);
-            g_config.items        = sConfigMgr->GetOption<bool>("ManaLootPet.LootItems", true);
-            g_config.mailOverflow = sConfigMgr->GetOption<bool>("ManaLootPet.MailWhenBagsFull", true);
-            g_config.maxItems     = sConfigMgr->GetOption<uint32>("ManaLootPet.MaxItemsPerCorpse", 20);
+            // Built whole, then moved in under the mutex, so a map thread reading the config never
+            // sees half of the old values and half of the new ones.
+            Config cfg;
+            cfg.enabled      = sConfigMgr->GetOption<bool>("ManaLootPet.Enable", true);
+            cfg.lootDistance = sConfigMgr->GetOption<float>("ManaLootPet.LootDistance", 1.5f);
+            cfg.reachMs      = sConfigMgr->GetOption<uint32>("ManaLootPet.ReachTimeoutMs", 8000);
+            cfg.money        = sConfigMgr->GetOption<bool>("ManaLootPet.LootMoney", true);
+            cfg.items        = sConfigMgr->GetOption<bool>("ManaLootPet.LootItems", true);
+            cfg.mailOverflow = sConfigMgr->GetOption<bool>("ManaLootPet.MailWhenBagsFull", true);
+            cfg.maxItems     = sConfigMgr->GetOption<uint32>("ManaLootPet.MaxItemsPerCorpse", 20);
 
             // A pet that has to touch the corpse needs a real distance; one far below it would just
             // loot the moment the kill lands. The timeout must at least outlast a walk across range.
-            if (g_config.lootDistance < 0.5f)
-                g_config.lootDistance = 0.5f;
-            if (g_config.reachMs < 1000)
-                g_config.reachMs = 1000;
-            if (!g_config.maxItems)
-                g_config.maxItems = 1;
+            if (cfg.lootDistance < 0.5f)
+                cfg.lootDistance = 0.5f;
+            if (cfg.reachMs < 1000)
+                cfg.reachMs = 1000;
+            if (!cfg.maxItems)
+                cfg.maxItems = 1;
+
+            std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
+            g_config = cfg;
         }
 
         // The kill credit is raised once per creature, after the corpse's loot is generated and the
@@ -317,7 +461,11 @@ namespace
         // corpse is queued; the pet is only sent off when it is not already on its way somewhere.
         void OnPlayerCreatureKillCredit(Player* player, Creature* killed) override
         {
-            if (!canFetch(player, killed))
+            // The config is read once for the whole decision, before the lock: the fetch pass must not
+            // see a reload land between its gate and its walk.
+            Config const cfg = ReadConfig();
+
+            if (!canFetch(player, killed, cfg))
                 return;
 
             Creature* pet = GetCompanion(player);
@@ -326,7 +474,11 @@ namespace
 
             std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
 
-            Fetch& fetch = g_fetch[player->GetGUID()];
+            auto inserted = g_fetch.try_emplace(player->GetGUID());
+            if (inserted.second)
+                g_fetchCount.fetch_add(1, std::memory_order_release);
+
+            Fetch& fetch = inserted.first->second;
             fetch.pet    = pet->GetGUID();   // a resummon mid-queue: the old GUID is stale, this one is not
             fetch.queue.push_back(killed->GetGUID());
 
@@ -335,21 +487,31 @@ namespace
             // the update below walks it next, which is what chains a pull. A pet whose walk has run
             // out of time is not "already away" any more -- it is re-aimed here instead of being left
             // on a corpse it may not even be near.
-            if (fetch.queue.size() == 1 || fetch.done(g_nowMs))
+            if (fetch.queue.size() == 1 || fetch.done(g_nowMs, cfg.reachMs))
             {
                 fetch.startMs = g_nowMs;
-                SendToCorpse(pet, killed);
+                SendToCorpse(pet, killed, cfg.lootDistance);
             }
         }
 
         void OnPlayerUpdate(Player* player, uint32 /*p_time*/) override
         {
+            if (!player)
+                return;   // nothing to own a fetch; never dereferenced below
+
+            // Cheap unlocked early-out: with no fetch in flight anywhere there is nothing to drive,
+            // which is what keeps every player tick from serialising on g_fetchMutex.
+            if (!g_fetchCount.load(std::memory_order_acquire))
+                return;
+
+            Config const cfg = ReadConfig();
+
             // A player under play-time restriction must not receive loot, so a fetch that is still in
             // flight when the restriction lands is unwound here with a lock rather than a network
             // send: the companion is put back on its follow and the entry dropped.
-            bool const restricted = player && (player->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME) ||
-                                               player->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME));
-            if (!player || restricted)
+            bool const restricted = player->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME) ||
+                                    player->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME);
+            if (restricted)
             {
                 std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
 
@@ -357,7 +519,7 @@ namespace
                 if (stuck != g_fetch.end())
                 {
                     ResumeFollow(ObjectAccessor::GetCreature(*player, stuck->second.pet), player);
-                    g_fetch.erase(stuck);
+                    EraseFetch(stuck);
                 }
 
                 return;
@@ -378,7 +540,7 @@ namespace
             if (!pet || !pet->IsAlive())
             {
                 ResumeFollow(pet, player);
-                g_fetch.erase(itr);
+                EraseFetch(itr);
                 return;
             }
 
@@ -393,7 +555,7 @@ namespace
             if (fetch.queue.empty())
             {
                 ResumeFollow(pet, player);
-                g_fetch.erase(itr);
+                EraseFetch(itr);
                 return;
             }
 
@@ -405,8 +567,8 @@ namespace
             // bad body costs its own deadline instead of the whole pull; only a pet that never gets
             // anywhere drains the queue. The corpse itself is left exactly as it is, lootable flag
             // and decay untouched.
-            if (corpse->loot.isLooted() || fetch.done(g_nowMs) ||
-                !hasFetchableItem(player, &corpse->loot, corpse->loot.sourceWorldObjectGUID))
+            if (corpse->loot.isLooted() || fetch.done(g_nowMs, cfg.reachMs) ||
+                !hasFetchableItem(player, &corpse->loot, corpse->loot.sourceWorldObjectGUID, cfg))
             {
                 fetch.queue.erase(fetch.queue.begin());
                 fetch.startMs = g_nowMs;
@@ -414,53 +576,52 @@ namespace
                 if (fetch.queue.empty())
                 {
                     ResumeFollow(pet, player);
-                    g_fetch.erase(itr);
+                    EraseFetch(itr);
                     return;
                 }
 
-                SendToCorpse(pet, player->GetMap()->GetCreature(fetch.queue.front()));
+                SendToCorpse(pet, player->GetMap()->GetCreature(fetch.queue.front()), cfg.lootDistance);
                 return;
             }
 
-            if (!pet->IsWithinDistInMap(corpse, g_config.lootDistance))
+            if (!pet->IsWithinDistInMap(corpse, cfg.lootDistance))
             {
                 // Stopped and still out of range: the walk was interrupted (evade, resummon), so it is
                 // re-aimed here instead of waiting out a whole ReachTimeoutMs in place. A moving pet
                 // is left to finish its own walk.
                 if (!pet->HasUnitState(UNIT_STATE_ROAMING_MOVE))
-                    SendToCorpse(pet, corpse);
+                    SendToCorpse(pet, corpse, cfg.lootDistance);
 
                 return;
             }
 
             // LootCorpse fires script hooks, and a hook that leaves loot behind can re-enter
             // OnPlayerCreatureKillCredit -- which mutates g_fetch. So the entry is re-looked-up from
-            // its key afterwards instead of reusing a reference across the call, and the loot state is
-            // settled before the queue moves on. Holding the mutex throughout keeps the queue from
-            // being rewritten underneath this walk; std::recursive_mutex keeps the re-entry safe.
+            // its key afterwards, because a reference cannot be rebound and an erase/insert of the
+            // same key would leave the old one dangling. Holding the mutex throughout keeps the queue
+            // from being rewritten underneath this walk; std::recursive_mutex keeps the re-entry safe.
             ObjectGuid const playerGuid = player->GetGUID();
-            LootCorpse(player, corpse);
+            LootCorpse(player, corpse, cfg);
 
             itr = g_fetch.find(playerGuid);
             if (itr == g_fetch.end())
                 return;   // a re-entrant kill, a logout or an expired play time finished the fetch
 
-            fetch = itr->second;
-            pet  = ObjectAccessor::GetCreature(*player, fetch.pet);
+            pet = ObjectAccessor::GetCreature(*player, itr->second.pet);
 
             if (!corpse->loot.isLooted())
                 return;   // something was left for the player; a later kill re-aims at this corpse
 
-            if (fetch.queue.empty() || fetch.queue.front() != corpse->GetGUID())
+            if (itr->second.queue.empty() || itr->second.queue.front() != corpse->GetGUID())
                 return;   // the re-entry queued something ahead of this corpse
 
-            fetch.queue.erase(fetch.queue.begin());
-            fetch.startMs = g_nowMs;
+            itr->second.queue.erase(itr->second.queue.begin());
+            itr->second.startMs = g_nowMs;
 
-            if (fetch.queue.empty())
+            if (itr->second.queue.empty())
             {
                 ResumeFollow(pet, player);
-                g_fetch.erase(itr);
+                EraseFetch(itr);
                 return;
             }
 
@@ -469,7 +630,7 @@ namespace
             // on is still heading for the corpse just looted. Skipping the send on "already moving"
             // would leave it standing there with the rest of the queue never walked to -- the point
             // generator finalises, UNIT_STATE_ROAMING_MOVE clears, and nothing re-aims it ever again.
-            SendToCorpse(pet, player->GetMap()->GetCreature(fetch.queue.front()));
+            SendToCorpse(pet, player->GetMap()->GetCreature(itr->second.queue.front()), cfg.lootDistance);
         }
 
         void OnPlayerLogout(Player* player) override
@@ -478,7 +639,9 @@ namespace
                 return;
 
             std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
-            g_fetch.erase(player->GetGUID());
+            auto itr = g_fetch.find(player->GetGUID());
+            if (itr != g_fetch.end())
+                EraseFetch(itr);
         }
     };
 }
