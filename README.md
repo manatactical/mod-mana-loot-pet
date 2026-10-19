@@ -21,6 +21,7 @@ the same way a looted container's overflow already is.
 | a kill that dropped only money | fetched -- money counts as loot the pet can take |
 | skinning / pickpocketing loot | never taken -- separate windows on the same corpse |
 | a second kill while the pet is already fetching | queued behind the corpse it is walking to, looted one by one |
+| corpse further than `MaxDistance` from the player | queued, not fetched; the pet stays on follow and is sent once the player closes in |
 | pet dies, despawns, is dismissed, or gets stuck | the queue survives a resummon; the corpse it cannot reach is dropped and the next one is tried |
 | bags full | item is mailed (default) or left lootable, per `MailWhenBagsFull` |
 | player under a play-time restriction | not served, matching what the core's loot handlers refuse |
@@ -128,6 +129,7 @@ These are deliberate for now, not defects:
 |---|---|---|
 | `ManaLootPet.Enable` | 1 | master switch |
 | `ManaLootPet.LootDistance` | 1.5 | yards the pet must close before the loot is taken (also caps how far away it aims) |
+| `ManaLootPet.MaxDistance` | 40 | yards the player must be within before the pet is sent; a kill further away queues and waits for the player to close in (0 = no limit) |
 | `ManaLootPet.ReachTimeoutMs` | 8000 | how long the pet may walk to **one** corpse before that corpse is dropped (the rest of the queue is kept) |
 | `ManaLootPet.LootMoney` | 1 | take the corpse's money |
 | `ManaLootPet.LootItems` | 1 | take the corpse's items |

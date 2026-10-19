@@ -44,6 +44,7 @@ namespace
     {
         bool   enabled      = true;
         float  lootDistance = 1.5f;  // how close the pet must get before the corpse is looted
+        float  maxDistance  = 40.0f; // how close the player must be to a corpse before the pet is sent (0 = anywhere)
         uint32 reachMs      = 8000;  // a fetch older than this is abandoned (pet stuck or corpse gone)
         bool   money        = true;
         bool   items        = true;
@@ -64,12 +65,18 @@ namespace
         ObjectGuid              pet;
         uint32                  startMs = 0;   // when the walk to queue.front() was (re)started
 
+        // True while the pet is actually walking to queue.front(). A corpse the player is too far
+        // from is queued but not armed: the pet stays on its follow until the player closes in.
+        bool walking = false;
+
         // True once this leg of the walk has outlived ReachTimeoutMs. The timeout is per corpse: the
         // caller drops that corpse and gives the next one a fresh startMs. The deadline is passed in
         // rather than read from g_config so the caller reads the config once, under its own lock.
         [[nodiscard]] bool done(uint32 nowMs, uint32 reachMs) const
         {
-            return !pet || nowMs - startMs > reachMs;
+            // Only an armed walk runs out of time: a corpse still waiting for the player to close in
+            // has not been walked to yet, so its deadline has not started.
+            return !pet || (walking && nowMs - startMs > reachMs);
         }
     };
 
@@ -175,6 +182,19 @@ namespace
         // kills are fetched at all, so it has to count money as well as items.
         killed->loot.FillNotNormalLootFor(player);
         return hasFetchableItem(player, &killed->loot, killed->loot.sourceWorldObjectGUID, cfg);
+    }
+
+    // Is the player close enough for the pet to be sent over? A corpse across the zone would only
+    // make the pet walk off and time out, so the fetch waits until the player closes the gap. Checked
+    // against the player, not the pet: the pet follows the player, so its own distance says nothing
+    // about whether the player is coming.
+    bool inSendRange(Player* player, Creature* corpse, Config const& cfg)
+    {
+        if (!player || !corpse)
+            return false;
+        if (cfg.maxDistance <= 0.0f)
+            return true;   // 0 disables the gate
+        return player->IsWithinDistInMap(corpse, cfg.maxDistance);
     }
 
     // Point the pet at a corpse and let it walk. frand asserts max >= min, and lootDistance is only
@@ -437,6 +457,7 @@ namespace
             Config cfg;
             cfg.enabled      = sConfigMgr->GetOption<bool>("ManaLootPet.Enable", true);
             cfg.lootDistance = sConfigMgr->GetOption<float>("ManaLootPet.LootDistance", 1.5f);
+            cfg.maxDistance  = sConfigMgr->GetOption<float>("ManaLootPet.MaxDistance", 40.0f);
             cfg.reachMs      = sConfigMgr->GetOption<uint32>("ManaLootPet.ReachTimeoutMs", 8000);
             cfg.money        = sConfigMgr->GetOption<bool>("ManaLootPet.LootMoney", true);
             cfg.items        = sConfigMgr->GetOption<bool>("ManaLootPet.LootItems", true);
@@ -447,6 +468,9 @@ namespace
             // loot the moment the kill lands. The timeout must at least outlast a walk across range.
             if (cfg.lootDistance < 0.5f)
                 cfg.lootDistance = 0.5f;
+            // A negative MaxDistance is meaningless; clamp to 0, which is also the "no gate" value.
+            if (cfg.maxDistance < 0.0f)
+                cfg.maxDistance = 0.0f;
             if (cfg.reachMs < 1000)
                 cfg.reachMs = 1000;
             if (!cfg.maxItems)
@@ -486,11 +510,25 @@ namespace
             // Anything else is a kill that landed while it was already away: the queue takes it and
             // the update below walks it next, which is what chains a pull. A pet whose walk has run
             // out of time is not "already away" any more -- it is re-aimed here instead of being left
-            // on a corpse it may not even be near.
+            // on a corpse it may not even be near. A corpse the player is too far from is queued
+            // without a send: the pet stays on its follow and OnPlayerUpdate arms the walk once the
+            // player has closed the gap. Only the head of a queue of one is ever aimed at here, so a
+            // kill landing behind a corpse already waiting cannot leapfrog it.
             if (fetch.queue.size() == 1 || fetch.done(g_nowMs, cfg.reachMs))
             {
+                bool const wasWalking = fetch.walking;
+
                 fetch.startMs = g_nowMs;
-                SendToCorpse(pet, killed, cfg.lootDistance);
+                fetch.walking = false;
+
+                Creature* target = player->GetMap()->GetCreature(fetch.queue.front());
+                if (inSendRange(player, target, cfg))
+                {
+                    fetch.walking = true;
+                    SendToCorpse(pet, target, cfg.lootDistance);
+                }
+                else if (wasWalking)
+                    ResumeFollow(pet, player);   // a timed-out walk is being abandoned, not left running
             }
         }
 
@@ -550,6 +588,14 @@ namespace
             {
                 fetch.queue.erase(fetch.queue.begin());
                 fetch.startMs = g_nowMs;
+
+                // The walk in progress was aimed at the object that just went away, so the point
+                // generator it left is meaningless: put the follow back before arming the next stop.
+                if (fetch.walking)
+                {
+                    fetch.walking = false;
+                    ResumeFollow(pet, player);
+                }
             }
 
             if (fetch.queue.empty())
@@ -572,6 +618,7 @@ namespace
             {
                 fetch.queue.erase(fetch.queue.begin());
                 fetch.startMs = g_nowMs;
+                fetch.walking = false;
 
                 if (fetch.queue.empty())
                 {
@@ -580,7 +627,27 @@ namespace
                     return;
                 }
 
-                SendToCorpse(pet, player->GetMap()->GetCreature(fetch.queue.front()), cfg.lootDistance);
+                Creature* next = player->GetMap()->GetCreature(fetch.queue.front());
+                fetch.walking = inSendRange(player, next, cfg);
+                if (fetch.walking)
+                    SendToCorpse(pet, next, cfg.lootDistance);
+                else
+                    ResumeFollow(pet, player);
+                return;
+            }
+
+            // The player is not close enough for the pet to be sent over yet. The corpse stays at the
+            // head of the queue and the pet stays on its follow -- the follow generator already walks
+            // it back to the player, so there is nothing to re-issue each tick -- and closing the gap
+            // is what arms the walk. Nothing happens here until the player is in range.
+            if (!fetch.walking)
+            {
+                if (!inSendRange(player, corpse, cfg))
+                    return;
+
+                fetch.walking = true;
+                fetch.startMs = g_nowMs;
+                SendToCorpse(pet, corpse, cfg.lootDistance);
                 return;
             }
 
@@ -617,6 +684,7 @@ namespace
 
             itr->second.queue.erase(itr->second.queue.begin());
             itr->second.startMs = g_nowMs;
+            itr->second.walking = false;
 
             if (itr->second.queue.empty())
             {
@@ -625,12 +693,18 @@ namespace
                 return;
             }
 
-            // The pet is sent to the next corpse unconditionally. It has to be: the loot above happens
-            // the moment it is in range, which is usually while it is still walking, so the walk it is
-            // on is still heading for the corpse just looted. Skipping the send on "already moving"
-            // would leave it standing there with the rest of the queue never walked to -- the point
-            // generator finalises, UNIT_STATE_ROAMING_MOVE clears, and nothing re-aims it ever again.
-            SendToCorpse(pet, player->GetMap()->GetCreature(itr->second.queue.front()), cfg.lootDistance);
+            // The next stop is armed only when the player is already within MaxDistance of it; a
+            // corpse further away waits on the follow until the player closes in. The send itself is
+            // unconditional once armed, because the loot above happens while the pet is still walking
+            // -- skipping it on "already moving" would leave the point generator finalised with
+            // nothing to re-aim it, and the rest of the queue would never be walked.
+            Creature* next = player->GetMap()->GetCreature(itr->second.queue.front());
+            itr->second.walking = inSendRange(player, next, cfg);
+
+            if (itr->second.walking)
+                SendToCorpse(pet, next, cfg.lootDistance);
+            else
+                ResumeFollow(pet, player);
         }
 
         void OnPlayerLogout(Player* player) override

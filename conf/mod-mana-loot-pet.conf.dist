@@ -37,11 +37,23 @@ ManaLootPet.Enable = 1
 ManaLootPet.LootDistance = 1.5
 
 #
+#    ManaLootPet.MaxDistance
+#        Description: How close, in yards, the player must be to a corpse before the companion is sent
+#                     over. A kill further away only queues the corpse: the pet keeps following the
+#                     player and is sent the moment the gap is closed, so it never walks off across
+#                     the zone and times out. 0 disables the check and sends the pet from anywhere.
+#        Default:     40
+#
+
+ManaLootPet.MaxDistance = 40
+
+#
 #    ManaLootPet.ReachTimeoutMs
 #        Description: How long, in milliseconds, the companion may spend walking to one corpse
 #                     before that corpse is dropped and the next one in the queue is tried. Covers the
 #                     companion getting stuck, rooted or killed on the way, and a corpse that has
-#                     already decayed. Values below 1000 are raised to 1000.
+#                     already decayed. The clock starts when the pet is actually sent, so a corpse
+#                     waiting on MaxDistance does not consume it. Values below 1000 are raised to 1000.
 #        Default:     8000
 #
 
