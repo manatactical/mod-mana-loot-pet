@@ -137,8 +137,8 @@ ManaLootPet.QueueWithoutPetMs = 60000
 #                     companion is passive and immune, and only its emote and movement are driven.
 #                     A companion model with no attack animation simply stands there. A loot fetch in
 #                     progress always takes priority over the mimic.
-#        Default:     0 - Disabled
-#                     1 - Enabled
+#        Default:     1 - Enabled
+#                     0 - Disabled
 #
 
-ManaLootPet.MimicCombat = 0
+ManaLootPet.MimicCombat = 1

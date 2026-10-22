@@ -144,7 +144,7 @@ These are deliberate for now, not defects:
 | `ManaLootPet.MaxItemsPerCorpse` | 20 | most slots taken **or mailed** from one corpse in one fetch |
 | `ManaLootPet.PetIds` | (empty) | comma-separated creature entries allowed to fetch. Empty = any companion. A narrowed list also aborts a fetch already in flight on reload. |
 | `ManaLootPet.QueueWithoutPetMs` | 60000 | how long a kill waits for a companion to be summoned (0 = only fetch when a pet is already out) |
-| `ManaLootPet.MimicCombat` | 0 | cosmetic: pet follows the player's target and plays an unarmed swing animation. No damage, threat or combat state. |
+| `ManaLootPet.MimicCombat` | 1 | cosmetic: pet follows the player's target and plays an unarmed swing animation. No damage, threat or combat state. |
 
 The `.conf.dist` carries the full comments; the same defaults live in the code, so the module runs
 with the key absent.

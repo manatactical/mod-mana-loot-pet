@@ -43,6 +43,10 @@
 
 namespace
 {
+    // One definition of "is the mimic on by default", so the pre-config-load flag, the INI reader and
+    // the struct default cannot drift apart.
+    constexpr bool kMimicCombatDefault = true;
+
     struct Config
     {
         bool   enabled      = true;
@@ -54,7 +58,7 @@ namespace
         bool   mailOverflow = true;
         uint32 maxItems     = 20;    // most slots taken from one corpse in a single fetch
         uint32 petlessMs    = 60000; // how long a kill waits for a companion to be summoned
-        bool   mimicCombat  = false; // pretend to attack the player's target (animation only, no damage)
+        bool   mimicCombat  = kMimicCombatDefault; // pretend to attack the target (no damage)
         // Creature entries allowed to fetch. Empty = any companion, which is the historical behaviour.
         std::vector<uint32> petIds;
     };
@@ -142,17 +146,17 @@ namespace
     struct Mimic
     {
         ObjectGuid target;
-        uint32     nextMs    = 0;     // earliest tick this entry may be looked at again
         uint32     swingMs   = 0;     // earliest tick the next swing animation may play
-        bool       walking   = false; // a MovePoint was issued and has not been settled yet
+        bool       engaged   = false; // already stood beside the target once (hysteresis state)
+        uint32     walkSentMs = 0;    // last approach issued, so a refused MovePoint is retried slowly
     };
 
     std::unordered_map<ObjectGuid, Mimic> g_mimic;
     std::recursive_mutex                  g_mimicMutex;
 
-    // Read without the mutex on the hot path: with the feature off (the default) a player tick costs
-    // one relaxed load and nothing else.
-    std::atomic<bool> g_mimicEnabled{false};
+    // Read without the mutex on the hot path: with the feature off a player tick costs one relaxed load
+    // and nothing else. Seeded from the struct default so the flag is right before the first reload.
+    std::atomic<bool> g_mimicEnabled{kMimicCombatDefault};
 
     // How often the mimic is evaluated. It is a cosmetic, so a tenth of a second is plenty and keeps a
     // fully enabled server off this path 90% of the time.
@@ -301,21 +305,42 @@ namespace
                                                MOTION_SLOT_ACTIVE);
     }
 
-    // How close the pet has to be before it starts pretending to swing.
-    constexpr float kMimicRange = 3.0f;
+    // How close the pet stands to the target while imitating an attack, and how far it may drift
+    // before walking back. The gap between the two is the hysteresis: with one threshold the pet
+    // re-issues a walk the moment it drifts a hair over the line, which reads as constant fidgeting.
+    constexpr float kMimicRange    = 2.5f;
+    constexpr float kMimicRelease  = 4.0f;
 
     // How often the pet throws a swing animation. The emote is a pure SMSG_EMOTE; nothing in the
     // combat system is touched, so the rate only has to look right, not match a real attack speed.
     constexpr uint32 kMimicSwingMs = 1500;
 
-    // Where the pet stands to "attack" the target: beside it, outside its own hitbox.
+    // Minimum gap between two approaches. Only reached when a walk finished outside range or was
+    // refused outright: the normal case issues one MovePoint and then stands still.
+    constexpr uint32 kMimicRetryMs = 1000;
+
+    // Where the pet stands to "attack" the target: beside it, clear of the target's own body, and
+    // already turned toward it. The spot is on the side the pet is *already* on, so it takes the
+    // shortest walk and never circles the target to a fresh random angle. The orientation is handed to
+    // MovePoint so the pet arrives facing the target instead of spinning on the spot after the spline.
     void SendToMimic(Creature* pet, Unit* target)
     {
         if (!pet || !target)
             return;
 
-        pet->GetMotionMaster()->MovePoint(0, target->GetNearPosition(
-            kMimicRange * 0.6f, frand(0.0f, 2.0f * std::numbers::pi_v<float>)));
+        // Angle from the target to the pet, expressed the way GetNearPosition wants it -- relative to
+        // the target's own orientation (MovePosition adds GetOrientation()). Approaching from where the
+        // pet already stands means the shortest walk, never a circle to a fresh random side.
+        float const fromPet = target->GetRelativeAngle(pet->GetPositionX(), pet->GetPositionY());
+
+        // Stand outside the target's model, not inside it: a raid boss has a combat reach of several
+        // yards, so a fixed offset would bury the companion in it.
+        float const stand = std::max(kMimicRange * 0.8f, target->GetCombatReach() + 1.0f);
+        Position const spot = target->GetNearPosition(stand, fromPet);
+
+        pet->GetMotionMaster()->MovePoint(0, spot.GetPositionX(), spot.GetPositionY(), spot.GetPositionZ(),
+                                          FORCED_MOVEMENT_NONE, 0.0f,
+                                          spot.GetAbsoluteAngle(target->GetPositionX(), target->GetPositionY()));
     }
 
     // The Postmaster's own letter text, as the core's `Player::SendItemRetrievalMail` uses it.
@@ -562,7 +587,7 @@ namespace
             cfg.mailOverflow = sConfigMgr->GetOption<bool>("ManaLootPet.MailWhenBagsFull", true);
             cfg.maxItems     = sConfigMgr->GetOption<uint32>("ManaLootPet.MaxItemsPerCorpse", 20);
             cfg.petlessMs    = sConfigMgr->GetOption<uint32>("ManaLootPet.QueueWithoutPetMs", 60000);
-            cfg.mimicCombat  = sConfigMgr->GetOption<bool>("ManaLootPet.MimicCombat", false);
+            cfg.mimicCombat  = sConfigMgr->GetOption<bool>("ManaLootPet.MimicCombat", kMimicCombatDefault);
 
             // "", "0" and "all" (or any unparsable token) leave the list empty, i.e. any companion.
             std::string const ids = sConfigMgr->GetOption<std::string>("ManaLootPet.PetIds", "");
@@ -673,13 +698,20 @@ namespace
 
         // The cosmetic mimic. It never touches the combat system: the minipet is REACT_PASSIVE and
         // immune, and both the motion generator and HandleEmoteCommand only move and animate it, so no
-        // damage, threat, aggro or combat state is ever involved. It runs on its own mutex and its own
-        // 10 Hz clock so a cosmetic feature never serialises the loot path or spams MovePoint.
+        // damage, threat, aggro or combat state is ever involved.
+        //
+        // The 10 Hz gate is deliberately lock-free and stateless: each player is assigned one slot of
+        // the current 100 ms window by its own GUID, so a fully enabled server takes this mutex ~10
+        // times per second per player instead of once per map tick.
         void DriveMimic(Player* player, Config const& cfg, uint32 nowMs)
         {
+            if (player->GetGUID().GetCounter() % (kMimicCheckMs / 10) !=
+                (nowMs / 10) % (kMimicCheckMs / 10))
+                return;
+
             std::lock_guard<std::recursive_mutex> lock(g_mimicMutex);
 
-            auto     itr = g_mimic.find(player->GetGUID());
+            auto      itr = g_mimic.find(player->GetGUID());
             Creature* pet = GetCompanion(player);
 
             // The same gates the rest of the module honours: no pet, a companion PetIds excludes, or a
@@ -708,14 +740,10 @@ namespace
 
             Mimic& mimic = itr->second;
 
-            if (nowMs < mimic.nextMs)
-                return;
-            mimic.nextMs = nowMs + kMimicCheckMs;
-
             if (mimic.target != target->GetGUID())
             {
                 mimic.target  = target->GetGUID();
-                mimic.walking = false;
+                mimic.engaged = false;   // a fresh target is approached from scratch
             }
 
             // A walking loot fetch owns the active motion slot; the mimic waits its turn.
@@ -726,21 +754,33 @@ namespace
                     return;
             }
 
-            bool const inRange = pet->IsWithinDistInMap(target, kMimicRange);
+            // Two thresholds, not one: walk in at kMimicRelease, only call it "in position" at
+            // kMimicRange. A single value makes the pet step in and out around the boundary forever.
+            bool const inRange = pet->IsWithinDistInMap(target, mimic.engaged ? kMimicRelease : kMimicRange);
 
-            // Walk over, but only once per approach: the MovePoint is re-issued only when the pet has
-            // actually stopped short, never on every tick, which is what keeps this off the wire.
+            // Walk over, but only once per approach: a MovePoint is re-issued only after the previous
+            // spline stopped, and never faster than kMimicRetryMs, so a pet that cannot move at all
+            // (UNIT_FLAG_DISABLE_MOVE, an unreachable spot) does not emit a packet every tick.
             if (!inRange)
             {
-                if (!mimic.walking && !pet->HasUnitState(UNIT_STATE_ROAMING_MOVE))
+                mimic.engaged = false;
+
+                if (!pet->HasUnitState(UNIT_STATE_ROAMING_MOVE) && nowMs - mimic.walkSentMs >= kMimicRetryMs)
                 {
                     SendToMimic(pet, target);
-                    mimic.walking = true;
+                    mimic.walkSentMs = nowMs;
                 }
                 return;
             }
 
-            mimic.walking = false;
+            mimic.engaged = true;
+
+            // Turn to face the target before swinging, but only when it is genuinely looking away, so a
+            // stationary fight sends no movement packets at all. GetRelativeAngle is normalised to
+            // [0, 2pi), so facing either side of the wrap point has to be folded before comparing.
+            float const off = pet->GetRelativeAngle(target->GetPositionX(), target->GetPositionY());
+            if (std::min(off, 2.0f * std::numbers::pi_v<float> - off) > 0.25f)
+                pet->SetFacingToObject(target);
 
             if (nowMs < mimic.swingMs)
                 return;
