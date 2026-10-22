@@ -131,7 +131,8 @@ ManaLootPet.QueueWithoutPetMs = 60000
 
 #
 #    ManaLootPet.MimicCombat
-#        Description: Purely cosmetic. While the player has a target selected, the companion walks
+#        Description: Purely cosmetic. While the player is actually attacking a target (auto-attack
+#                     or an ability, not just a selection), the companion walks
 #                     beside it and periodically plays an unarmed attack animation, so it looks like it
 #                     is joining the fight. NO damage, no threat, no aggro, no combat state: the
 #                     companion is passive and immune, and only its emote and movement are driven.

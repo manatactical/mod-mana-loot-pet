@@ -722,8 +722,14 @@ namespace
                 return;
             }
 
+            // The pet only mimics a fight the player is really in: the unit must be selected, alive,
+            // not friendly, and either auto-attacked (GetVictim) or already carrying a combat reference
+            // from it. A bare selection -- or a friendly unit merely sharing a heal-induced combat ref --
+            // leaves the pet on follow instead of miming a fight the player never joined.
             Unit* target = player->GetSelectedUnit();
             if (target && (!target->IsAlive() || !target->IsInWorld() || target == pet ||
+                           player->IsFriendlyTo(target) ||
+                           (player->GetVictim() != target && !player->IsInCombatWith(target)) ||
                            !player->IsWithinDistInMap(target, cfg.maxDistance > 0.0f ? cfg.maxDistance : 40.0f)))
                 target = nullptr;
 
@@ -1060,12 +1066,18 @@ namespace
             if (!player)
                 return;
 
-            std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
-            auto itr = g_fetch.find(player->GetGUID());
-            if (itr != g_fetch.end())
-                EraseFetch(itr);
+            {
+                std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
+                auto itr = g_fetch.find(player->GetGUID());
+                if (itr != g_fetch.end())
+                    EraseFetch(itr);
+            }
 
-            g_mimic.erase(player->GetGUID());   // a logging-out player owns no motion slot to restore
+            // A logging-out player owns no motion slot to restore, but the map is still shared with the
+            // map threads, so the erase takes its own lock. Never nested with the fetch lock: the mimic
+            // path takes g_mimicMutex first, and a second lock order would deadlock against it.
+            std::lock_guard<std::recursive_mutex> mimicLock(g_mimicMutex);
+            g_mimic.erase(player->GetGUID());
         }
     };
 }
