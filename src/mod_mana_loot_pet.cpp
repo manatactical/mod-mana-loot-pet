@@ -52,6 +52,7 @@ namespace
         bool   items        = true;
         bool   mailOverflow = true;
         uint32 maxItems     = 20;    // most slots taken from one corpse in a single fetch
+        uint32 petlessMs    = 60000; // how long a kill waits for a companion to be summoned
         // Creature entries allowed to fetch. Empty = any companion, which is the historical behaviour.
         std::vector<uint32> petIds;
     };
@@ -76,11 +77,15 @@ namespace
         // True once this leg of the walk has outlived ReachTimeoutMs. The timeout is per corpse: the
         // caller drops that corpse and gives the next one a fresh startMs. The deadline is passed in
         // rather than read from g_config so the caller reads the config once, under its own lock.
-        [[nodiscard]] bool done(uint32 nowMs, uint32 reachMs) const
+        // `petlessMs` rather than reachMs: a queue with no companion at all needs a longer grace, so a
+        // pet summoned a few seconds after the kill still fetches it (0 = never queue without a pet).
+        [[nodiscard]] bool done(uint32 nowMs, uint32 reachMs, uint32 petlessMs) const
         {
-            // Only an armed walk runs out of time: a corpse still waiting for the player to close in
-            // has not been walked to yet, so its deadline has not started.
-            return !pet || (walking && nowMs - startMs > reachMs);
+            if (!pet)
+                return !petlessMs || nowMs - startMs > petlessMs;
+
+            // A corpse waiting for the player to close in has not been walked to yet.
+            return walking && nowMs - startMs > reachMs;
         }
     };
 
@@ -188,7 +193,13 @@ namespace
         if (player->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME) ||
             player->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
             return false;
-        if (!companionAllowed(GetCompanion(player), cfg))
+        // A missing companion no longer aborts the fetch: the corpse waits in the queue for one to be
+        // summoned, for QueueWithoutPetMs (0 disables that and restores the old pet-only gate). An
+        // unlisted companion, though, never fetches, so there is nothing to queue for.
+        Creature* const companion = GetCompanion(player);
+        if (companion && !companionAllowed(companion, cfg))
+            return false;
+        if (!companion && !cfg.petlessMs)
             return false;
 
         // Nothing the pet can help itself to is still no reason to walk over there: a corpse holding
@@ -478,6 +489,7 @@ namespace
             cfg.items        = sConfigMgr->GetOption<bool>("ManaLootPet.LootItems", true);
             cfg.mailOverflow = sConfigMgr->GetOption<bool>("ManaLootPet.MailWhenBagsFull", true);
             cfg.maxItems     = sConfigMgr->GetOption<uint32>("ManaLootPet.MaxItemsPerCorpse", 20);
+            cfg.petlessMs    = sConfigMgr->GetOption<uint32>("ManaLootPet.QueueWithoutPetMs", 60000);
 
             // "", "0" and "all" (or any unparsable token) leave the list empty, i.e. any companion.
             std::string const ids = sConfigMgr->GetOption<std::string>("ManaLootPet.PetIds", "");
@@ -507,6 +519,10 @@ namespace
                 cfg.reachMs = 1000;
             if (!cfg.maxItems)
                 cfg.maxItems = 1;
+            // 0 means "never queue a kill without a companion"; cap the rest at a day so a typo
+            // cannot pin a fetch for a week.
+            if (cfg.petlessMs > 24u * 60 * 60 * 1000)
+                cfg.petlessMs = 24u * 60 * 60 * 1000;
 
             std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
             g_config = cfg;
@@ -525,8 +541,6 @@ namespace
                 return;
 
             Creature* pet = GetCompanion(player);
-            if (!pet)
-                return;   // canFetch said there was one; a summon can still land between its two calls
 
             std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
 
@@ -535,8 +549,16 @@ namespace
                 g_fetchCount.fetch_add(1, std::memory_order_release);
 
             Fetch& fetch = inserted.first->second;
-            fetch.pet    = pet->GetGUID();   // a resummon mid-queue: the old GUID is stale, this one is not
             fetch.queue.push_back(killed->GetGUID());
+
+            // A resummon mid-queue: the old GUID is stale, this one is not. With no companion the
+            // queue is left petless, and a summon picks it up on the next player tick. The grace clock
+            // is re-anchored to this kill so a corpse appended to an already waiting queue gets its
+            // own window instead of inheriting one that may already be spent.
+            if (pet)
+                fetch.pet = pet->GetGUID();
+            else
+                fetch.startMs = g_nowMs;
 
             // A queue of one means the pet had nowhere to be, so this new corpse is its next stop.
             // Anything else is a kill that landed while it was already away: the queue takes it and
@@ -546,7 +568,7 @@ namespace
             // without a send: the pet stays on its follow and OnPlayerUpdate arms the walk once the
             // player has closed the gap. Only the head of a queue of one is ever aimed at here, so a
             // kill landing behind a corpse already waiting cannot leapfrog it.
-            if (fetch.queue.size() == 1 || fetch.done(g_nowMs, cfg.reachMs))
+            if (fetch.queue.size() == 1 || fetch.done(g_nowMs, cfg.reachMs, cfg.petlessMs))
             {
                 bool const wasWalking = fetch.walking;
 
@@ -554,7 +576,7 @@ namespace
                 fetch.walking = false;
 
                 Creature* target = player->GetMap()->GetCreature(fetch.queue.front());
-                if (inSendRange(player, target, cfg))
+                if (pet && inSendRange(player, target, cfg))
                 {
                     fetch.walking = true;
                     SendToCorpse(pet, target, cfg.lootDistance);
@@ -602,25 +624,32 @@ namespace
                 return;
 
             Fetch& fetch = itr->second;
-            Creature* pet = ObjectAccessor::GetCreature(*player, fetch.pet);
+            Creature* pet = fetch.pet ? ObjectAccessor::GetCreature(*player, fetch.pet) : nullptr;
 
-            // A companion that vanished or died takes the queue with it: the corpses it never
-            // reached stay manually lootable. A walk running late is NOT handled here -- one slow leg
-            // must not discard the rest of the pull, so it drops that corpse below and moves on.
-            if (!pet || !pet->IsAlive())
+            // Resolve the companion actually walking the queue. A petless queue is kept, not dropped:
+            // the corpse was lootable while no companion (or an unlisted one, which never fetches) was
+            // out, and it waits here until a summon adopts it. A summon that replaces the pet -- or a
+            // swap for another listed companion -- adopts the fresh GUID the same way, because the
+            // stale one resolves to nullptr above. Only a dead or unlisted companion drops the queue:
+            // the corpses it never reached stay manually lootable.
+            if (!pet || !pet->IsAlive() || !companionAllowed(pet, cfg))
             {
-                ResumeFollow(pet, player);
-                EraseFetch(itr);
-                return;
-            }
+                Creature* replacement = GetCompanion(player);
 
-            // A reload that narrowed PetIds must stop a fetch already in flight: the pet is put back
-            // on its follow and the queue dropped, exactly as for a dismissed companion.
-            if (!companionAllowed(pet, cfg))
-            {
-                ResumeFollow(pet, player);
-                EraseFetch(itr);
-                return;
+                if (replacement && replacement->IsAlive() && companionAllowed(replacement, cfg))
+                {
+                    pet           = replacement;
+                    fetch.pet     = pet->GetGUID();
+                    fetch.startMs = g_nowMs;   // the new walk's clock, not the old pet's
+                    fetch.walking = false;     // whatever generator the old pet had is gone with it
+                }
+                else if (pet)
+                {
+                    ResumeFollow(pet, player);
+                    EraseFetch(itr);
+                    return;
+                }
+                // else: still petless, and the branch below keeps the corpse queued.
             }
 
             // Drop what is no longer worth walking to: a despawned object.
@@ -646,6 +675,17 @@ namespace
                 return;
             }
 
+            // Nothing further can be done without a companion: the corpse keeps waiting. A corpse that
+            // emptied, or whose grace window ran out, is dropped -- the grace is what stops a player
+            // with no pet holding a fetch (and its g_fetchCount early-out) forever.
+            if (!pet)
+            {
+                Creature* head = player->GetMap()->GetCreature(fetch.queue.front());
+                if (!head || head->loot.isLooted() || fetch.done(g_nowMs, cfg.reachMs, cfg.petlessMs))
+                    EraseFetch(itr);
+                return;
+            }
+
             Creature* corpse = player->GetMap()->GetCreature(fetch.queue.front());
 
             // A corpse is skipped when it is already empty, when it holds nothing the pet may take,
@@ -654,7 +694,7 @@ namespace
             // bad body costs its own deadline instead of the whole pull; only a pet that never gets
             // anywhere drains the queue. The corpse itself is left exactly as it is, lootable flag
             // and decay untouched.
-            if (corpse->loot.isLooted() || fetch.done(g_nowMs, cfg.reachMs) ||
+            if (corpse->loot.isLooted() || fetch.done(g_nowMs, cfg.reachMs, cfg.petlessMs) ||
                 !hasFetchableItem(player, &corpse->loot, corpse->loot.sourceWorldObjectGUID, cfg))
             {
                 fetch.queue.erase(fetch.queue.begin());

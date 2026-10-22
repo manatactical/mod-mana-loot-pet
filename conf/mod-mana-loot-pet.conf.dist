@@ -4,7 +4,8 @@
 # The player's vanity companion (a non-combat pet) walks to a fresh corpse and loots it. Only a
 # creature whose sole loot recipient is the killing player is served, so group loot rules and rolls
 # are never bypassed, and one corpse is walked at a time -- a pull that kills several creatures queues
-# them and the pet visits each in turn.
+# them and the pet visits each in turn. A kill that lands with no companion out is queued too, and a
+# companion summoned within QueueWithoutPetMs of it still walks over.
 #
 
 [worldserver]
@@ -106,7 +107,24 @@ ManaLootPet.MaxItemsPerCorpse = 20
 #                     (for example 34337 for the Postmaster, or 29726/29725 for a pet you own).
 #                     Empty means every vanity companion may fetch, which is the default. An id
 #                     that is not a number is ignored; a list with no valid id counts as empty.
+#                     A companion that is not on the list never fetches, and a reload that narrows
+#                     the list stops a fetch already in flight. A kill that lands with *no* companion
+#                     out is still queued for QueueWithoutPetMs, so summoning one in that window
+#                     fetches it.
 #        Default:     "" - any companion
 #
 
 ManaLootPet.PetIds = ""
+
+#
+#    ManaLootPet.QueueWithoutPetMs
+#        Description: How long, in milliseconds, a corpse killed with no companion out waits for one to
+#                     be summoned and walk over to it. The clock starts at the kill, so a pet summoned
+#                     inside the window still fetches the corpse; a corpse that despawns or is emptied
+#                     in the meantime is dropped at once. 0 disables the feature: only a kill that lands
+#                     while a companion is already out is fetched (the behaviour before this key).
+#                     Capped at 24 hours.
+#        Default:     60000 (one minute)
+#
+
+ManaLootPet.QueueWithoutPetMs = 60000

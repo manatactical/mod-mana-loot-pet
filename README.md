@@ -23,6 +23,7 @@ the same way a looted container's overflow already is.
 | a second kill while the pet is already fetching | queued behind the corpse it is walking to, looted one by one |
 | corpse further than `MaxDistance` from the player | queued, not fetched; the pet stays on follow and is sent once the player closes in |
 | pet dies, despawns, is dismissed, or gets stuck | the queue survives a resummon; the corpse it cannot reach is dropped and the next one is tried |
+| a kill that lands with no companion out | queued for `QueueWithoutPetMs`; a companion summoned in that window walks it, otherwise the corpse stays for a hand-loot |
 | bags full | item is mailed (default) or left lootable, per `MailWhenBagsFull` |
 | player under a play-time restriction | not served, matching what the core's loot handlers refuse |
 
@@ -136,6 +137,7 @@ These are deliberate for now, not defects:
 | `ManaLootPet.MailWhenBagsFull` | 1 | mail an item that no longer fits |
 | `ManaLootPet.MaxItemsPerCorpse` | 20 | most slots taken **or mailed** from one corpse in one fetch |
 | `ManaLootPet.PetIds` | (empty) | comma-separated creature entries allowed to fetch. Empty = any companion. A narrowed list also aborts a fetch already in flight on reload. |
+| `ManaLootPet.QueueWithoutPetMs` | 60000 | how long a kill waits for a companion to be summoned (0 = only fetch when a pet is already out) |
 
 The `.conf.dist` carries the full comments; the same defaults live in the code, so the module runs
 with the key absent.

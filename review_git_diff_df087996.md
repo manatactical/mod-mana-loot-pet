@@ -1,0 +1,19 @@
+## Git Diff Review
+
+**2 critical, 3 warnings, 2 suggestions**
+
+🔴 **2 Critical**
+
+- `src/mod_mana_loot_pet.cpp:560` - Petless-queue adopt path is incomplete: when a companion is summoned into an existing petless fetch, `fetch.pet` is never updated (only `OnPlayerCreatureKillCredit` sets it, and that only runs when a *new* kill lands). In `OnPlayerUpdate`, `pet = fetch.pet ? GetCreature(...) : nullptr` therefore stays null forever, so the queued corpse is never walked after the summon — contradicting the new README/conf promise (`a companion summoned in that window walks it`) and the new 60 s grace, which instead just deletes the queue. The update pass must look up `GetCompanion(player)` when `fetch.pet` is empty, refresh `fetch.pet` from it, and resume the walk.
+- `src/mod_mana_loot_pet.cpp:661` - `done()` grace window is not anchored to the kill: `startMs` is only set when the queue is armed or a corpse is dropped. A queue created petless in `OnPlayerCreatureKillCredit` does get `startMs = g_nowMs` on the `queue.size() == 1` branch, but a corpse appended to an *existing* waiting (non-walking) queue with no pet leaves `startMs` at its old value, so the 60 s grace measured from the previous corpse's start can expire almost immediately (or the corpse is erased at once when `g_nowMs - startMs` already exceeds 60 s). `done()` returning true on the `!pet` path silently discards the whole queue (`EraseFetch`) including a freshly queued kill.
+
+🟡 **3 Warnings**
+
+- `src/mod_mana_loot_pet.cpp:82` - `done()` uses `nowMs - startMs > 60 * 1000`, which mixes a hard-coded constant with the configurable `reachMs`. The 60 s grace is not a config key, so it does not follow the project's 'one INI key lives in six places' rule and cannot be tuned; move it to a named `Config` field (e.g. `petlessGraceMs`) with a `.conf` default, reader, docs and README entry, or at minimum a named constant with a comment.
+- `src/mod_mana_loot_pet.cpp:614` - The comment says 'or an unlisted one, which never fetches' is a reason a queue can be petless, but `canFetch` (line ~197) still returns false for a non-null unlisted companion, so a queue can never *become* petless that way for an existing fetch: an unlisted companion dismisses via the `companionAllowed` branch below. Conversely, a corpse queued while a *different*, listed pet was out and then swapped for an unlisted one is dropped (correct), but swapped for a *listed* one also keeps the stale `fetch.pet` GUID — same defect class as the first finding. The comment is inaccurate and misleads the next reader.
+- `src/mod_mana_loot_pet.cpp:640` - The petless branch dereferences `player->GetMap()->GetCreature(fetch.queue.front())` for every entry on every tick (despawn sweep) and returns before any loot re-validation. A corpse that despawns is fine, but a petless queue is swept only by despawn and the 60 s grace — no `hasFetchableItem` / `isLooted` check, so an occupied-but-now-empty corpse keeps a fetch alive (and `g_fetchCount` non-zero, forcing every player tick through `g_fetchMutex`) for the whole grace period. Cheap to fold into the same `!pet` branch: drop the queue if the head is already looted.
+
+🔵 **2 Suggestions**
+
+- `src/mod_mana_loot_pet.cpp:196` - `canFetch` now queues corpses for players with no companion at all, which widens the gate considerably (every solo kill by a pet-less player creates a `Fetch` entry and an atomic increment). Consider gating on `cfg.enabled` plus an explicit config switch (e.g. `QueueWithoutCompanion`, default true/on) so servers can opt out of the 60 s bookkeeping entirely; at minimum note the cost in the `.conf` comment.
+- `README.md:26` - Docs assert `a companion summoned in that window walks it`, but per the findings above the summon is never adopted, so the documented behaviour does not match the implementation. Fix the code or revert the doc row.
