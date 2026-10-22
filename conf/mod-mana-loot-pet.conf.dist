@@ -99,3 +99,14 @@ ManaLootPet.MailWhenBagsFull = 1
 #
 
 ManaLootPet.MaxItemsPerCorpse = 20
+
+#
+#    ManaLootPet.PetIds
+#        Description: Creature entries of the companions allowed to fetch loot, comma separated
+#                     (for example 34337 for the Postmaster, or 29726/29725 for a pet you own).
+#                     Empty means every vanity companion may fetch, which is the default. An id
+#                     that is not a number is ignored; a list with no valid id counts as empty.
+#        Default:     "" - any companion
+#
+
+ManaLootPet.PetIds = ""

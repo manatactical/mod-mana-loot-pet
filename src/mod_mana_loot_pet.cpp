@@ -30,10 +30,12 @@
 #include "Random.h"
 #include "ScriptMgr.h"
 #include "Timer.h"
+#include "Tokenize.h"
 #include "WorldPacket.h"
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <mutex>
 #include <numbers>
 #include <unordered_map>
@@ -50,6 +52,8 @@ namespace
         bool   items        = true;
         bool   mailOverflow = true;
         uint32 maxItems     = 20;    // most slots taken from one corpse in a single fetch
+        // Creature entries allowed to fetch. Empty = any companion, which is the historical behaviour.
+        std::vector<uint32> petIds;
     };
 
     Config g_config;   // rebuilt whole, under g_fetchMutex, by a config reload
@@ -117,6 +121,17 @@ namespace
         return player ? player->GetCompanionPet() : nullptr;
     }
 
+    // Is this companion one the config lets fetch? An empty list means every companion may, so an
+    // untouched .conf keeps the module behaving as it always did.
+    bool companionAllowed(Creature* pet, Config const& cfg)
+    {
+        if (!pet)
+            return false;
+        if (cfg.petIds.empty())
+            return true;
+        return std::find(cfg.petIds.begin(), cfg.petIds.end(), pet->GetEntry()) != cfg.petIds.end();
+    }
+
     // An item is worth mailing only when the only thing standing in its way was room in the bags
     // (or a unique the player already owns). The core's other refusals -- blocked, won by another
     // roller, not allowed for this player -- must leave the item on the corpse for its rightful
@@ -173,7 +188,7 @@ namespace
         if (player->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME) ||
             player->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
             return false;
-        if (!GetCompanion(player))
+        if (!companionAllowed(GetCompanion(player), cfg))
             return false;
 
         // Nothing the pet can help itself to is still no reason to walk over there: a corpse holding
@@ -464,6 +479,23 @@ namespace
             cfg.mailOverflow = sConfigMgr->GetOption<bool>("ManaLootPet.MailWhenBagsFull", true);
             cfg.maxItems     = sConfigMgr->GetOption<uint32>("ManaLootPet.MaxItemsPerCorpse", 20);
 
+            // "", "0" and "all" (or any unparsable token) leave the list empty, i.e. any companion.
+            std::string const ids = sConfigMgr->GetOption<std::string>("ManaLootPet.PetIds", "");
+            for (std::string_view token : Acore::Tokenize(ids, ',', false))
+            {
+                // Tolerate "1, 2" spacing in the .conf.
+                size_t const first = token.find_first_not_of(" \t");
+                if (first == std::string_view::npos)
+                    continue;
+                token.remove_prefix(first);
+                token.remove_suffix(token.size() - token.find_last_not_of(" \t") - 1);
+
+                uint32 entry = 0;
+                auto const [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), entry);
+                if (ec == std::errc() && ptr == token.data() + token.size() && entry)
+                    cfg.petIds.push_back(entry);
+            }
+
             // A pet that has to touch the corpse needs a real distance; one far below it would just
             // loot the moment the kill lands. The timeout must at least outlast a walk across range.
             if (cfg.lootDistance < 0.5f)
@@ -576,6 +608,15 @@ namespace
             // reached stay manually lootable. A walk running late is NOT handled here -- one slow leg
             // must not discard the rest of the pull, so it drops that corpse below and moves on.
             if (!pet || !pet->IsAlive())
+            {
+                ResumeFollow(pet, player);
+                EraseFetch(itr);
+                return;
+            }
+
+            // A reload that narrowed PetIds must stop a fetch already in flight: the pet is put back
+            // on its follow and the queue dropped, exactly as for a dismissed companion.
+            if (!companionAllowed(pet, cfg))
             {
                 ResumeFollow(pet, player);
                 EraseFetch(itr);

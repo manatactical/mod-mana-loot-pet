@@ -135,6 +135,7 @@ These are deliberate for now, not defects:
 | `ManaLootPet.LootItems` | 1 | take the corpse's items |
 | `ManaLootPet.MailWhenBagsFull` | 1 | mail an item that no longer fits |
 | `ManaLootPet.MaxItemsPerCorpse` | 20 | most slots taken **or mailed** from one corpse in one fetch |
+| `ManaLootPet.PetIds` | (empty) | comma-separated creature entries allowed to fetch. Empty = any companion. A narrowed list also aborts a fetch already in flight on reload. |
 
 The `.conf.dist` carries the full comments; the same defaults live in the code, so the module runs
 with the key absent.
