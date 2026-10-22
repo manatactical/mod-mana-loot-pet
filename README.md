@@ -45,6 +45,11 @@ client's loot window is untouched and the corpse looks exactly as it does when l
   point generator clears `UNIT_STATE_ROAMING_MOVE` when it finishes, so "stopped and in range" is the
   pet standing on the corpse. A stop that is still out of range was interrupted (evade, resummon)
   and is re-aimed on the next tick.
+- The per-player cost is bounded: `PlayerScript::OnPlayerUpdate` early-outs on a lock-free atomic when
+  no fetch is live anywhere, and a live fetch is polled every 100 ms rather than at the map tick
+  (`kCheckIntervalMs`), so a walking pet costs ~10 checks a second instead of ~100. The config is a
+  snapshot swapped whole on reload, so reading it never takes the fetch lock; that lock is held only
+  while a fetch is actually being advanced.
 - The loot pass mirrors the core's own single-player path (`HandleAutostoreLootItemOpcode` and
   `HandleLootMoneyOpcode`): `Loot::FillNotNormalLootFor`, `Player::StoreLootItem`, `Loot::gold` and
   the money achievement. Reusing `Player::StoreLootItem` keeps its own guards -- master-loot

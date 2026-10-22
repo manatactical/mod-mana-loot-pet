@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <memory>
 #include <mutex>
 #include <numbers>
 #include <unordered_map>
@@ -57,7 +58,13 @@ namespace
         std::vector<uint32> petIds;
     };
 
-    Config g_config;   // rebuilt whole, under g_fetchMutex, by a config reload
+    // Published whole and read under its own (otherwise never taken) mutex: a map thread never sees
+    // half of one config, and the read never contends with the fetch lock. Read at most once per
+    // polled fetch, so the lock costs nothing measurable. A shared_ptr rather than a value type on
+    // purpose: a kill credit can land before OnAfterConfigLoad publishes the real config, and the
+    // default-constructed snapshot is what makes that path safe.
+    std::shared_ptr<Config const> g_config = std::make_shared<Config const>();
+    std::mutex                    g_configMutex;
 
     // One entry per player: the corpses the companion still owes a visit, in the order they dropped.
     // The pet's own GUID is kept because a companion summoned or dismissed mid-fetch makes the
@@ -68,7 +75,12 @@ namespace
     {
         std::vector<ObjectGuid> queue;
         ObjectGuid              pet;
-        uint32                  startMs = 0;   // when the walk to queue.front() was (re)started
+        // when the walk to queue.front() was (re)started
+        uint32                  startMs = 0;
+
+        // When this fetch may next be looked at. The player-tick hook polls a fetch at 10 Hz rather
+        // than at the map tick, which is the difference between a few checks a second and a hundred.
+        uint32 nextCheckMs = 0;
 
         // True while the pet is actually walking to queue.front(). A corpse the player is too far
         // from is queued but not armed: the pet stays on its follow until the player closes in.
@@ -76,7 +88,7 @@ namespace
 
         // True once this leg of the walk has outlived ReachTimeoutMs. The timeout is per corpse: the
         // caller drops that corpse and gives the next one a fresh startMs. The deadline is passed in
-        // rather than read from g_config so the caller reads the config once, under its own lock.
+        // rather than read from the published config so a caller reads that config once per pass.
         // `petlessMs` rather than reachMs: a queue with no companion at all needs a longer grace, so a
         // pet summoned a few seconds after the kill still fetches it (0 = never queue without a pet).
         [[nodiscard]] bool done(uint32 nowMs, uint32 reachMs, uint32 petlessMs) const
@@ -89,24 +101,31 @@ namespace
         }
     };
 
-    // Every read or write of g_fetch, and of the clock the walks are timed against, holds
-    // g_fetchMutex: the three hooks below can run on different map update threads (MapUpdate.Threads
-    // above 1), one of them re-enters through a script hook, and one sends a packet.
+    // How often a live fetch is polled. The player tick runs at the map interval (10 ms by default),
+    // an order of magnitude more often than a walking pet needs: at a 1.5 yard tolerance a walk takes
+    // hundreds of milliseconds per yard, so ~100 ms of extra latency is invisible in game.
+    constexpr uint32 kCheckIntervalMs = 100;
+
+    // All fetches live behind one recursive mutex. Sharding them by player GUID was tried and
+    // rejected: `LootCorpse` holds the lock while it fires script hooks, and a hook that credits a kill
+    // for a *different* player would take that player's shard lock while this one is held -- a
+    // lock-order inversion between two map threads, which a recursive mutex cannot rescue. One lock
+    // keeps the invariant simple: no code path ever holds two of them.
+    // shortcut: one mutex for all fetches, contention only matters past a few hundred concurrent
+    // fetches; shard by map, not by GUID, if that is ever measured.
     std::unordered_map<ObjectGuid, Fetch> g_fetch;
     std::recursive_mutex                  g_fetchMutex;
 
-    // How many players have a fetch in flight. Read without the lock as an early-out, so the common
-    // player tick -- no companion fetch anywhere -- never serialises the map threads on g_fetchMutex.
+    // Read without any lock as an early-out, so the common player tick -- no companion fetch anywhere
+    // -- never takes the mutex.
     std::atomic<uint32> g_fetchCount{0};
 
-    // A reload rebuilds the config on the world thread while the map threads read it, so a read goes
-    // through the same recursive mutex that guards the fetches: never a torn value, and safe to call
-    // from inside a hook that already holds it.
-    Config ReadConfig()
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
-        return g_config;
-    }
+    // The world tick keeps the clock. Atomic rather than mutex-guarded: a reader must never wait on
+    // the world thread to learn what time it is. It is advisory, not a synchronisation point: a map
+    // thread may read a value one world tick old, which only shortens or extends a deadline by that
+    // tick. All arithmetic is unsigned subtraction, so a stale read can never wrap into a huge value.
+    // A fresh process starts at 1 so that "never set" cannot read as a fetch that started at zero.
+    std::atomic<uint32> g_nowMs{1};
 
     // Every erase of a fetch goes through here, so g_fetchCount cannot drift from g_fetch.
     void EraseFetch(std::unordered_map<ObjectGuid, Fetch>::iterator itr)
@@ -115,9 +134,22 @@ namespace
         g_fetchCount.fetch_sub(1, std::memory_order_release);
     }
 
-    // Refresh the clock once per world tick so N players cost one call rather than one each. A fresh
-    // process starts at 1 so that "never set" cannot read as a fetch that started at zero.
-    uint32 g_nowMs = 1;
+    // The config is read through a snapshot: a reload publishes a whole new Config and the reader
+    // keeps its own reference, so the call it is in never sees half of an old and half of a new one.
+    // A short mutex rather than an atomic shared_ptr: this is at most one read per polled fetch, and
+    // a lock that is never contended in practice is cheaper than the portability of atomic<shared_ptr>.
+    std::shared_ptr<Config const> ReadConfig()
+    {
+        std::lock_guard<std::mutex> lock(g_configMutex);
+        return g_config;
+    }
+
+    void PublishConfig(Config cfg)
+    {
+        auto published = std::make_shared<Config const>(std::move(cfg));
+        std::lock_guard<std::mutex> lock(g_configMutex);
+        g_config = std::move(published);
+    }
 
     // The companion the player currently owns, or nullptr. A pet summoned or dismissed mid-fetch
     // makes the GUID stale, which the update below simply drops.
@@ -472,14 +504,13 @@ namespace
 
         void OnUpdate(uint32 /*diff*/) override
         {
-            std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
-            g_nowMs = getMSTime();
+            g_nowMs.store(getMSTime(), std::memory_order_relaxed);
         }
 
         void OnAfterConfigLoad(bool /*reload*/) override
         {
-            // Built whole, then moved in under the mutex, so a map thread reading the config never
-            // sees half of the old values and half of the new ones.
+            // Built whole, then published whole, so a map thread reading the config never sees half of
+            // the old values and half of the new ones.
             Config cfg;
             cfg.enabled      = sConfigMgr->GetOption<bool>("ManaLootPet.Enable", true);
             cfg.lootDistance = sConfigMgr->GetOption<float>("ManaLootPet.LootDistance", 1.5f);
@@ -524,8 +555,8 @@ namespace
             if (cfg.petlessMs > 24u * 60 * 60 * 1000)
                 cfg.petlessMs = 24u * 60 * 60 * 1000;
 
-            std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
-            g_config = cfg;
+            // Published whole, so a reader either sees the old config or the new one, never a mix.
+            PublishConfig(std::move(cfg));
         }
 
         // The kill credit is raised once per creature, after the corpse's loot is generated and the
@@ -533,11 +564,11 @@ namespace
         // corpse is queued; the pet is only sent off when it is not already on its way somewhere.
         void OnPlayerCreatureKillCredit(Player* player, Creature* killed) override
         {
-            // The config is read once for the whole decision, before the lock: the fetch pass must not
-            // see a reload land between its gate and its walk.
-            Config const cfg = ReadConfig();
+            // The config is read once for the whole decision: the fetch pass must not see a reload land
+            // between its gate and its walk.
+            std::shared_ptr<Config const> cfg = ReadConfig();
 
-            if (!canFetch(player, killed, cfg))
+            if (!canFetch(player, killed, *cfg))
                 return;
 
             Creature* pet = GetCompanion(player);
@@ -546,7 +577,10 @@ namespace
 
             auto inserted = g_fetch.try_emplace(player->GetGUID());
             if (inserted.second)
+            {
                 g_fetchCount.fetch_add(1, std::memory_order_release);
+                inserted.first->second.nextCheckMs = g_nowMs.load(std::memory_order_relaxed);
+            }
 
             Fetch& fetch = inserted.first->second;
             fetch.queue.push_back(killed->GetGUID());
@@ -558,7 +592,7 @@ namespace
             if (pet)
                 fetch.pet = pet->GetGUID();
             else
-                fetch.startMs = g_nowMs;
+                fetch.startMs = g_nowMs.load(std::memory_order_relaxed);
 
             // A queue of one means the pet had nowhere to be, so this new corpse is its next stop.
             // Anything else is a kill that landed while it was already away: the queue takes it and
@@ -568,18 +602,21 @@ namespace
             // without a send: the pet stays on its follow and OnPlayerUpdate arms the walk once the
             // player has closed the gap. Only the head of a queue of one is ever aimed at here, so a
             // kill landing behind a corpse already waiting cannot leapfrog it.
-            if (fetch.queue.size() == 1 || fetch.done(g_nowMs, cfg.reachMs, cfg.petlessMs))
+            if (fetch.queue.size() == 1 || fetch.done(g_nowMs.load(std::memory_order_relaxed), cfg->reachMs, cfg->petlessMs))
             {
                 bool const wasWalking = fetch.walking;
 
-                fetch.startMs = g_nowMs;
+                fetch.startMs = g_nowMs.load(std::memory_order_relaxed);
                 fetch.walking = false;
+                // Re-aimed now, so this corpse is due on the next player tick rather than waiting out
+                // a throttle window that was started by the corpse it just replaced.
+                fetch.nextCheckMs = fetch.startMs;
 
                 Creature* target = player->GetMap()->GetCreature(fetch.queue.front());
-                if (pet && inSendRange(player, target, cfg))
+                if (pet && inSendRange(player, target, *cfg))
                 {
                     fetch.walking = true;
-                    SendToCorpse(pet, target, cfg.lootDistance);
+                    SendToCorpse(pet, target, cfg->lootDistance);
                 }
                 else if (wasWalking)
                     ResumeFollow(pet, player);   // a timed-out walk is being abandoned, not left running
@@ -591,12 +628,23 @@ namespace
             if (!player)
                 return;   // nothing to own a fetch; never dereferenced below
 
-            // Cheap unlocked early-out: with no fetch in flight anywhere there is nothing to drive,
-            // which is what keeps every player tick from serialising on g_fetchMutex.
+            // Cheap unlocked early-out: with no fetch in flight anywhere there is nothing to drive, so
+            // the common player tick never takes the mutex.
             if (!g_fetchCount.load(std::memory_order_acquire))
                 return;
 
-            Config const cfg = ReadConfig();
+            uint32 const nowMs = g_nowMs.load(std::memory_order_relaxed);
+
+            // One lock for the whole pass: find the fetch, then decide whether it is due. The throttle
+            // comes first so a player whose fetch is not due -- restricted or not -- costs one hash
+            // lookup and no config read, instead of serialising on the mutex at the map tick rate.
+            std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
+
+            auto itr = g_fetch.find(player->GetGUID());
+            if (itr == g_fetch.end() || nowMs < itr->second.nextCheckMs)
+                return;
+
+            itr->second.nextCheckMs = nowMs + kCheckIntervalMs;
 
             // A player under play-time restriction must not receive loot, so a fetch that is still in
             // flight when the restriction lands is unwound here with a lock rather than a network
@@ -605,23 +653,14 @@ namespace
                                     player->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME);
             if (restricted)
             {
-                std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
-
-                auto stuck = g_fetch.find(player->GetGUID());
-                if (stuck != g_fetch.end())
-                {
-                    ResumeFollow(ObjectAccessor::GetCreature(*player, stuck->second.pet), player);
-                    EraseFetch(stuck);
-                }
-
+                ResumeFollow(ObjectAccessor::GetCreature(*player, itr->second.pet), player);
+                EraseFetch(itr);
                 return;
             }
 
-            std::lock_guard<std::recursive_mutex> lock(g_fetchMutex);
-
-            auto itr = g_fetch.find(player->GetGUID());
-            if (itr == g_fetch.end())
-                return;
+            // Read after the throttle, so a player whose fetch is not due yet does not even copy the
+            // config snapshot.
+            std::shared_ptr<Config const> cfg = ReadConfig();
 
             Fetch& fetch = itr->second;
             Creature* pet = fetch.pet ? ObjectAccessor::GetCreature(*player, fetch.pet) : nullptr;
@@ -632,15 +671,15 @@ namespace
             // swap for another listed companion -- adopts the fresh GUID the same way, because the
             // stale one resolves to nullptr above. Only a dead or unlisted companion drops the queue:
             // the corpses it never reached stay manually lootable.
-            if (!pet || !pet->IsAlive() || !companionAllowed(pet, cfg))
+            if (!pet || !pet->IsAlive() || !companionAllowed(pet, *cfg))
             {
                 Creature* replacement = GetCompanion(player);
 
-                if (replacement && replacement->IsAlive() && companionAllowed(replacement, cfg))
+                if (replacement && replacement->IsAlive() && companionAllowed(replacement, *cfg))
                 {
                     pet           = replacement;
                     fetch.pet     = pet->GetGUID();
-                    fetch.startMs = g_nowMs;   // the new walk's clock, not the old pet's
+                    fetch.startMs = nowMs;     // the new walk's clock, not the old pet's
                     fetch.walking = false;     // whatever generator the old pet had is gone with it
                 }
                 else if (pet)
@@ -657,7 +696,7 @@ namespace
                    !player->GetMap()->GetCreature(fetch.queue.front()))
             {
                 fetch.queue.erase(fetch.queue.begin());
-                fetch.startMs = g_nowMs;
+                fetch.startMs = nowMs;
 
                 // The walk in progress was aimed at the object that just went away, so the point
                 // generator it left is meaningless: put the follow back before arming the next stop.
@@ -681,7 +720,7 @@ namespace
             if (!pet)
             {
                 Creature* head = player->GetMap()->GetCreature(fetch.queue.front());
-                if (!head || head->loot.isLooted() || fetch.done(g_nowMs, cfg.reachMs, cfg.petlessMs))
+                if (!head || head->loot.isLooted() || fetch.done(nowMs, cfg->reachMs, cfg->petlessMs))
                     EraseFetch(itr);
                 return;
             }
@@ -694,11 +733,11 @@ namespace
             // bad body costs its own deadline instead of the whole pull; only a pet that never gets
             // anywhere drains the queue. The corpse itself is left exactly as it is, lootable flag
             // and decay untouched.
-            if (corpse->loot.isLooted() || fetch.done(g_nowMs, cfg.reachMs, cfg.petlessMs) ||
-                !hasFetchableItem(player, &corpse->loot, corpse->loot.sourceWorldObjectGUID, cfg))
+            if (corpse->loot.isLooted() || fetch.done(nowMs, cfg->reachMs, cfg->petlessMs) ||
+                !hasFetchableItem(player, &corpse->loot, corpse->loot.sourceWorldObjectGUID, *cfg))
             {
                 fetch.queue.erase(fetch.queue.begin());
-                fetch.startMs = g_nowMs;
+                fetch.startMs = nowMs;
                 fetch.walking = false;
 
                 if (fetch.queue.empty())
@@ -709,9 +748,9 @@ namespace
                 }
 
                 Creature* next = player->GetMap()->GetCreature(fetch.queue.front());
-                fetch.walking = inSendRange(player, next, cfg);
+                fetch.walking = inSendRange(player, next, *cfg);
                 if (fetch.walking)
-                    SendToCorpse(pet, next, cfg.lootDistance);
+                    SendToCorpse(pet, next, cfg->lootDistance);
                 else
                     ResumeFollow(pet, player);
                 return;
@@ -723,22 +762,22 @@ namespace
             // is what arms the walk. Nothing happens here until the player is in range.
             if (!fetch.walking)
             {
-                if (!inSendRange(player, corpse, cfg))
+                if (!inSendRange(player, corpse, *cfg))
                     return;
 
                 fetch.walking = true;
-                fetch.startMs = g_nowMs;
-                SendToCorpse(pet, corpse, cfg.lootDistance);
+                fetch.startMs = nowMs;
+                SendToCorpse(pet, corpse, cfg->lootDistance);
                 return;
             }
 
-            if (!pet->IsWithinDistInMap(corpse, cfg.lootDistance))
+            if (!pet->IsWithinDistInMap(corpse, cfg->lootDistance))
             {
                 // Stopped and still out of range: the walk was interrupted (evade, resummon), so it is
                 // re-aimed here instead of waiting out a whole ReachTimeoutMs in place. A moving pet
                 // is left to finish its own walk.
                 if (!pet->HasUnitState(UNIT_STATE_ROAMING_MOVE))
-                    SendToCorpse(pet, corpse, cfg.lootDistance);
+                    SendToCorpse(pet, corpse, cfg->lootDistance);
 
                 return;
             }
@@ -749,7 +788,7 @@ namespace
             // same key would leave the old one dangling. Holding the mutex throughout keeps the queue
             // from being rewritten underneath this walk; std::recursive_mutex keeps the re-entry safe.
             ObjectGuid const playerGuid = player->GetGUID();
-            LootCorpse(player, corpse, cfg);
+            LootCorpse(player, corpse, *cfg);
 
             itr = g_fetch.find(playerGuid);
             if (itr == g_fetch.end())
@@ -764,7 +803,7 @@ namespace
                 return;   // the re-entry queued something ahead of this corpse
 
             itr->second.queue.erase(itr->second.queue.begin());
-            itr->second.startMs = g_nowMs;
+            itr->second.startMs = nowMs;
             itr->second.walking = false;
 
             if (itr->second.queue.empty())
@@ -780,10 +819,10 @@ namespace
             // -- skipping it on "already moving" would leave the point generator finalised with
             // nothing to re-aim it, and the rest of the queue would never be walked.
             Creature* next = player->GetMap()->GetCreature(itr->second.queue.front());
-            itr->second.walking = inSendRange(player, next, cfg);
+            itr->second.walking = inSendRange(player, next, *cfg);
 
             if (itr->second.walking)
-                SendToCorpse(pet, next, cfg.lootDistance);
+                SendToCorpse(pet, next, cfg->lootDistance);
             else
                 ResumeFollow(pet, player);
         }
