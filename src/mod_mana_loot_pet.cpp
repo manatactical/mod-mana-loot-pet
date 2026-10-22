@@ -54,6 +54,7 @@ namespace
         bool   mailOverflow = true;
         uint32 maxItems     = 20;    // most slots taken from one corpse in a single fetch
         uint32 petlessMs    = 60000; // how long a kill waits for a companion to be summoned
+        bool   mimicCombat  = false; // pretend to attack the player's target (animation only, no damage)
         // Creature entries allowed to fetch. Empty = any companion, which is the historical behaviour.
         std::vector<uint32> petIds;
     };
@@ -133,6 +134,29 @@ namespace
         g_fetch.erase(itr);
         g_fetchCount.fetch_sub(1, std::memory_order_release);
     }
+
+    // The cosmetic mimic's own state, keyed by player, behind its own mutex. A separate map and a
+    // separate lock because the mimic must work for a player with no corpse queued at all, and because
+    // it must never serialise against the loot fetch: a cosmetic feature has no business on the lock
+    // the real one uses.
+    struct Mimic
+    {
+        ObjectGuid target;
+        uint32     nextMs    = 0;     // earliest tick this entry may be looked at again
+        uint32     swingMs   = 0;     // earliest tick the next swing animation may play
+        bool       walking   = false; // a MovePoint was issued and has not been settled yet
+    };
+
+    std::unordered_map<ObjectGuid, Mimic> g_mimic;
+    std::recursive_mutex                  g_mimicMutex;
+
+    // Read without the mutex on the hot path: with the feature off (the default) a player tick costs
+    // one relaxed load and nothing else.
+    std::atomic<bool> g_mimicEnabled{false};
+
+    // How often the mimic is evaluated. It is a cosmetic, so a tenth of a second is plenty and keeps a
+    // fully enabled server off this path 90% of the time.
+    constexpr uint32 kMimicCheckMs = 100;
 
     // The config is read through a snapshot: a reload publishes a whole new Config and the reader
     // keeps its own reference, so the call it is in never sees half of an old and half of a new one.
@@ -275,6 +299,23 @@ namespace
         if (pet && player)
             pet->GetMotionMaster()->MoveFollow(player, PET_FOLLOW_DIST, MINI_PET_FOLLOW_ANGLE,
                                                MOTION_SLOT_ACTIVE);
+    }
+
+    // How close the pet has to be before it starts pretending to swing.
+    constexpr float kMimicRange = 3.0f;
+
+    // How often the pet throws a swing animation. The emote is a pure SMSG_EMOTE; nothing in the
+    // combat system is touched, so the rate only has to look right, not match a real attack speed.
+    constexpr uint32 kMimicSwingMs = 1500;
+
+    // Where the pet stands to "attack" the target: beside it, outside its own hitbox.
+    void SendToMimic(Creature* pet, Unit* target)
+    {
+        if (!pet || !target)
+            return;
+
+        pet->GetMotionMaster()->MovePoint(0, target->GetNearPosition(
+            kMimicRange * 0.6f, frand(0.0f, 2.0f * std::numbers::pi_v<float>)));
     }
 
     // The Postmaster's own letter text, as the core's `Player::SendItemRetrievalMail` uses it.
@@ -521,6 +562,7 @@ namespace
             cfg.mailOverflow = sConfigMgr->GetOption<bool>("ManaLootPet.MailWhenBagsFull", true);
             cfg.maxItems     = sConfigMgr->GetOption<uint32>("ManaLootPet.MaxItemsPerCorpse", 20);
             cfg.petlessMs    = sConfigMgr->GetOption<uint32>("ManaLootPet.QueueWithoutPetMs", 60000);
+            cfg.mimicCombat  = sConfigMgr->GetOption<bool>("ManaLootPet.MimicCombat", false);
 
             // "", "0" and "all" (or any unparsable token) leave the list empty, i.e. any companion.
             std::string const ids = sConfigMgr->GetOption<std::string>("ManaLootPet.PetIds", "");
@@ -556,7 +598,13 @@ namespace
                 cfg.petlessMs = 24u * 60 * 60 * 1000;
 
             // Published whole, so a reader either sees the old config or the new one, never a mix.
+            bool const wasEnabled = g_mimicEnabled.exchange(cfg.mimicCombat, std::memory_order_relaxed);
             PublishConfig(std::move(cfg));
+
+            // A reload that turns the feature off must also unpark the pets already standing on a
+            // target, or they would stay there until each player logs out.
+            if (wasEnabled && !g_mimicEnabled.load(std::memory_order_relaxed))
+                DropAllMimics();
         }
 
         // The kill credit is raised once per creature, after the corpse's loot is generated and the
@@ -623,17 +671,157 @@ namespace
             }
         }
 
+        // The cosmetic mimic. It never touches the combat system: the minipet is REACT_PASSIVE and
+        // immune, and both the motion generator and HandleEmoteCommand only move and animate it, so no
+        // damage, threat, aggro or combat state is ever involved. It runs on its own mutex and its own
+        // 10 Hz clock so a cosmetic feature never serialises the loot path or spams MovePoint.
+        void DriveMimic(Player* player, Config const& cfg, uint32 nowMs)
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_mimicMutex);
+
+            auto     itr = g_mimic.find(player->GetGUID());
+            Creature* pet = GetCompanion(player);
+
+            // The same gates the rest of the module honours: no pet, a companion PetIds excludes, or a
+            // disabled module all mean the pet behaves exactly as it did before this feature.
+            if (!pet || !pet->IsAlive() || !companionAllowed(pet, cfg))
+            {
+                DropMimic(itr, player, nullptr);
+                return;
+            }
+
+            Unit* target = player->GetSelectedUnit();
+            if (target && (!target->IsAlive() || !target->IsInWorld() || target == pet ||
+                           !player->IsWithinDistInMap(target, cfg.maxDistance > 0.0f ? cfg.maxDistance : 40.0f)))
+                target = nullptr;
+
+            // Nothing worth mimicking: restore the follow once, then forget the state so an idle player
+            // costs nothing on later ticks. Never clobber a walk the loot fetch owns.
+            if (!target)
+            {
+                DropMimic(itr, player, pet);
+                return;
+            }
+
+            if (itr == g_mimic.end())
+                itr = g_mimic.try_emplace(player->GetGUID()).first;
+
+            Mimic& mimic = itr->second;
+
+            if (nowMs < mimic.nextMs)
+                return;
+            mimic.nextMs = nowMs + kMimicCheckMs;
+
+            if (mimic.target != target->GetGUID())
+            {
+                mimic.target  = target->GetGUID();
+                mimic.walking = false;
+            }
+
+            // A walking loot fetch owns the active motion slot; the mimic waits its turn.
+            {
+                std::lock_guard<std::recursive_mutex> lootLock(g_fetchMutex);
+                auto fetchItr = g_fetch.find(player->GetGUID());
+                if (fetchItr != g_fetch.end() && fetchItr->second.walking)
+                    return;
+            }
+
+            bool const inRange = pet->IsWithinDistInMap(target, kMimicRange);
+
+            // Walk over, but only once per approach: the MovePoint is re-issued only when the pet has
+            // actually stopped short, never on every tick, which is what keeps this off the wire.
+            if (!inRange)
+            {
+                if (!mimic.walking && !pet->HasUnitState(UNIT_STATE_ROAMING_MOVE))
+                {
+                    SendToMimic(pet, target);
+                    mimic.walking = true;
+                }
+                return;
+            }
+
+            mimic.walking = false;
+
+            if (nowMs < mimic.swingMs)
+                return;
+
+            // Animation only: EMOTE_ONESHOT_ATTACK_UNARMED is a bare SMSG_EMOTE. A companion model
+            // without an attack animation simply ignores it.
+            pet->HandleEmoteCommand(EMOTE_ONESHOT_ATTACK_UNARMED);
+            mimic.swingMs = nowMs + kMimicSwingMs;
+        }
+
+        // Drop the mimic state and put the pet back on its follow, unless the loot path owns the
+        // motion slot or the pet is not there to be moved.
+        void DropMimic(std::unordered_map<ObjectGuid, Mimic>::iterator itr, Player* player, Creature* pet)
+        {
+            if (itr == g_mimic.end())
+                return;
+
+            g_mimic.erase(itr);
+
+            if (!pet)
+                return;
+
+            std::lock_guard<std::recursive_mutex> lootLock(g_fetchMutex);
+            if (g_fetch.find(player->GetGUID()) == g_fetch.end())
+                ResumeFollow(pet, player);
+        }
+
+        // A config reload that turns the feature off must also release the pets already parked on a
+        // target, or they would stay there until the player logs out.
+        void DropAllMimics()
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_mimicMutex);
+
+            for (auto itr = g_mimic.begin(); itr != g_mimic.end(); ++itr)
+            {
+                Player* player = ObjectAccessor::FindPlayer(itr->first);
+                Creature* pet  = GetCompanion(player);
+                if (!pet)
+                    continue;
+
+                std::lock_guard<std::recursive_mutex> lootLock(g_fetchMutex);
+                if (g_fetch.find(itr->first) == g_fetch.end())
+                    ResumeFollow(pet, player);
+            }
+
+            g_mimic.clear();
+        }
+
+        // Release one player's mimic state (logout, or a play-time restriction landing).
+        void ClearMimic(Player* player)
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_mimicMutex);
+            auto itr = g_mimic.find(player->GetGUID());
+            if (itr != g_mimic.end())
+                DropMimic(itr, player, GetCompanion(player));
+        }
+
         void OnPlayerUpdate(Player* player, uint32 /*p_time*/) override
         {
             if (!player)
                 return;   // nothing to own a fetch; never dereferenced below
 
-            // Cheap unlocked early-out: with no fetch in flight anywhere there is nothing to drive, so
-            // the common player tick never takes the mutex.
+            uint32 const nowMs = g_nowMs.load(std::memory_order_relaxed);
+
+            // The mimic runs before the fetch paths and outside their early-out: most players never
+            // have a corpse queued, and the mimic is the whole point of the feature for them.
+            if (g_mimicEnabled.load(std::memory_order_relaxed))
+            {
+                // Read once for the whole mimic decision. A play-time-restricted player is not
+                // served by the loot path either, so the pet goes back on its follow.
+                if (player->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME) ||
+                    player->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
+                    ClearMimic(player);
+                else
+                    DriveMimic(player, *ReadConfig(), nowMs);
+            }
+
+            // Cheap unlocked early-out: with no fetch in flight anywhere there is nothing left to
+            // drive, so the common player tick never takes the mutex here.
             if (!g_fetchCount.load(std::memory_order_acquire))
                 return;
-
-            uint32 const nowMs = g_nowMs.load(std::memory_order_relaxed);
 
             // One lock for the whole pass: find the fetch, then decide whether it is due. The throttle
             // comes first so a player whose fetch is not due -- restricted or not -- costs one hash
@@ -836,6 +1024,8 @@ namespace
             auto itr = g_fetch.find(player->GetGUID());
             if (itr != g_fetch.end())
                 EraseFetch(itr);
+
+            g_mimic.erase(player->GetGUID());   // a logging-out player owns no motion slot to restore
         }
     };
 }
